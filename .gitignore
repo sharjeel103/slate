@@ -1,0 +1,29 @@
+# Virtual environment
+venv/
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Debian packaging staging directory
+debian-build/
+*.deb
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local config and temp test files
+temp.pdf
+.pytest_cache/
+.vscode/
+.idea/
+.DS_Store
+
+# Agent skills and instructions
+.agents/
+
