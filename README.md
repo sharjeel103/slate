@@ -34,10 +34,13 @@
 | **`H`** | **Highlight** | Highlight text in active color. |
 | **`P`** | **Pen** | Draw/sketch freely. |
 | **`T`** | **Text** | Click to type text. Click existing text to edit/drag. |
+| **`S`** | **Square** | Draw a rectangle/square outline shape. |
+| **`A`** | **Arrow** | Draw an arrow shape. |
 | **`E`** | **Eraser** | Click/drag over any annotation to delete it. |
 | **`R`** | **Rect Selection** | Toggle rectangle-box selection mode on/off. |
-| **`1` - `5`** | **Colors** | Yellow (`1`), Red (`2`), Green (`3`), Blue (`4`), Black (`5`). |
+| **`1` - `5`** | **Colors** | Yellow (`1`), Blue (`2`), Green (`3`), Red (`4`), Black (`5`). |
 | **`O` / `0` / `F9`** | **Toggle Outline** | Toggle the Table of Contents / Outline sidebar. |
+| **`J` / `K`** | **Vim Scroll** | Scroll vertical canvas down / up smoothly. |
 | **`Ctrl + S`** | **Save** | Save edits directly to the PDF file. |
 | **`Ctrl + O`** | **Open** | Open a new PDF. |
 | **`Ctrl + =` / `-`** | **Zoom** | Zoom In / Zoom Out. |

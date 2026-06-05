@@ -7,6 +7,7 @@ def main():
     # Allow high DPI scaling for crisp rendering on high DPI monitors (like Ubuntu 4K displays)
     app = QApplication(sys.argv)
     app.setApplicationName("Slate")
+    app.setDesktopFileName("slate")
     
     window = MainWindow()
     window.show()

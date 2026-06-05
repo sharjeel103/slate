@@ -16,7 +16,6 @@ class MainWindow(QMainWindow):
         
         self.setWindowTitle("Slate")
         self.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "app_icon.png")))
-        self.resize(1100, 850)
         
         # Apply premium dark theme stylesheet
         self.setStyleSheet("""
@@ -146,8 +145,7 @@ class MainWindow(QMainWindow):
         self.viewer = PDFViewer(self.state, self)
         self.splitter.addWidget(self.viewer)
         
-        # Set initial sizes (start collapsed)
-        self.splitter.setSizes([0, 1100])
+        # Connect splitter moved signal
         self.splitter.splitterMoved.connect(self.on_splitter_moved)
         
         layout.addWidget(self.splitter)
@@ -175,6 +173,32 @@ class MainWindow(QMainWindow):
         
         # Initialize outline default state
         self.populate_outline()
+        
+        # Restore window geometry, state, and splitter sizes
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("Slate", "SlateReader")
+        
+        geometry = settings.value("geometry")
+        state = settings.value("windowState")
+        splitter_state = settings.value("splitterState")
+        
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(1100, 850)
+            
+        if state:
+            self.restoreState(state)
+            
+        if splitter_state:
+            self.splitter.restoreState(splitter_state)
+        else:
+            self.splitter.setSizes([0, 1100])
+            
+        # Sync toggle button checked state with the restored splitter
+        if hasattr(self, 'btn_outline'):
+            sizes = self.splitter.sizes()
+            self.btn_outline.setChecked(sizes[0] > 0)
 
     def create_actions_and_shortcuts(self):
         # Open
@@ -251,6 +275,8 @@ class MainWindow(QMainWindow):
             Tool.HIGHLIGHT: "🖍️",
             Tool.PEN: "✎",
             Tool.TEXT: "T",
+            Tool.SQUARE: "□",
+            Tool.ARROW: "➔",
             Tool.ERASER: "🧽"
         }
         for tool in Tool:
@@ -330,6 +356,20 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
         
+        # Line Width Selector
+        self.line_width_spin = QSpinBox(self)
+        self.line_width_spin.setRange(1, 20)
+        self.line_width_spin.setValue(self.state.active_line_width)
+        self.line_width_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.line_width_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.line_width_spin.setFixedWidth(28)
+        self.line_width_spin.setFixedHeight(28)
+        self.line_width_spin.setToolTip("Line Width (Pen/Shapes)")
+        self.line_width_spin.valueChanged.connect(self.set_line_width)
+        toolbar.addWidget(self.line_width_spin)
+
+        toolbar.addSeparator()
+        
         # Zoom Controls
         btn_zoom_in = QPushButton("+", self)
         btn_zoom_in.clicked.connect(self.viewer.zoom_in)
@@ -374,6 +414,10 @@ class MainWindow(QMainWindow):
     def set_font_size(self, size):
         self.state.active_font_size = size
         self.show_status_message(f"Selected Font Size: {size}")
+
+    def set_line_width(self, width):
+        self.state.active_line_width = width
+        self.show_status_message(f"Selected Line Width: {width}")
 
     def toggle_rect_select_mode(self, checked=None):
         if checked is None:
@@ -486,6 +530,14 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.maybe_save_changes():
             self.save_current_position()
+            
+            # Save geometry, state, and splitter sizes
+            from PyQt6.QtCore import QSettings
+            settings = QSettings("Slate", "SlateReader")
+            settings.setValue("geometry", self.saveGeometry())
+            settings.setValue("windowState", self.saveState())
+            settings.setValue("splitterState", self.splitter.saveState())
+            
             event.accept()
         else:
             event.ignore()
@@ -515,6 +567,7 @@ class MainWindow(QMainWindow):
             self.show_status_message(f"Opened: {os.path.basename(filepath)}")
             self.restore_position()
             self.populate_outline()
+            self.viewer.setFocus()
         except Exception as e:
             self.show_status_message(f"Error opening file: {str(e)}")
 
@@ -665,12 +718,24 @@ class MainWindow(QMainWindow):
             self.set_tool(Tool.PEN)
         elif key == Qt.Key.Key_T:
             self.set_tool(Tool.TEXT)
+        elif key == Qt.Key.Key_S:
+            self.set_tool(Tool.SQUARE)
+        elif key == Qt.Key.Key_A:
+            self.set_tool(Tool.ARROW)
         elif key == Qt.Key.Key_E:
             self.set_tool(Tool.ERASER)
         elif key == Qt.Key.Key_R:
             self.toggle_rect_select_mode()
         elif key in (Qt.Key.Key_O, Qt.Key.Key_0, Qt.Key.Key_F9):
             self.toggle_outline()
+
+        # Vim-style scrolling (J down, K up)
+        elif key == Qt.Key.Key_J:
+            bar = self.viewer.verticalScrollBar()
+            bar.setValue(bar.value() + bar.singleStep() * 3)
+        elif key == Qt.Key.Key_K:
+            bar = self.viewer.verticalScrollBar()
+            bar.setValue(bar.value() - bar.singleStep() * 3)
 
         elif key == Qt.Key.Key_1:
             self.set_color(1)

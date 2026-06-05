@@ -43,11 +43,12 @@ class PDFDocument:
         page = self.doc[page_num]
         return page.get_text("words")
 
-    def add_pen_annotation(self, page_num, point_list, color_rgb):
+    def add_pen_annotation(self, page_num, point_list, color_rgb, width=2):
         """
         Adds a freehand ink annotation to the page.
         point_list: list of (x, y) coordinates in PDF points.
         color_rgb: tuple of (r, g, b) floats (0.0 to 1.0).
+        width: line thickness.
         """
         if len(point_list) < 2:
             return
@@ -57,6 +58,7 @@ class PDFDocument:
         raw_points = [[(float(p[0]), float(p[1])) for p in point_list]]
         annot = page.add_ink_annot(raw_points)
         annot.set_colors(stroke=color_rgb)
+        annot.set_border(width=width)
         annot.update()
 
     def add_highlight_annotation(self, page_num, rect_list, color_rgb):
@@ -93,6 +95,77 @@ class PDFDocument:
             text_color=color_rgb
         )
         annot.update()
+
+    def add_square_annotation(self, page_num, rect, color_rgb, width=2):
+        """
+        Adds a rectangle/square outline annotation.
+        rect: fitz.Rect in PDF points.
+        color_rgb: tuple of (r, g, b) floats (0.0 to 1.0).
+        width: line thickness.
+        """
+        page = self.doc[page_num]
+        annot = page.add_rect_annot(rect)
+        annot.set_colors(stroke=color_rgb)
+        annot.set_border(width=width)
+        annot.update()
+
+    def add_arrow_annotation(self, page_num, p1, p2, color_rgb, width=2):
+        """
+        Adds a line with a custom-proportioned arrowhead as a single Ink annotation.
+        p1, p2: fitz.Point or (x, y) tuple in PDF points.
+        color_rgb: tuple of (r, g, b) floats (0.0 to 1.0).
+        width: line thickness.
+        """
+        page = self.doc[page_num]
+        
+        x1, y1 = float(p1[0]), float(p1[1])
+        x2, y2 = float(p2[0]), float(p2[1])
+        
+        dx = x2 - x1
+        dy = y2 - y1
+        length = (dx**2 + dy**2)**0.5
+        
+        if length == 0:
+            return
+            
+        # Normalize direction vector
+        ux = dx / length
+        uy = dy / length
+        
+        # Calculate balanced arrowhead wing size
+        base_size = 6.0 + 1.5 * width
+        base_size = min(base_size, 18.0)
+        arrow_size = min(base_size, length * 0.3)
+        if length > 10:
+            arrow_size = max(arrow_size, 5.0)
+        
+        # Rotate vector to get arrowhead wings (30-degree angle from shaft pointing backward)
+        # cos(150 deg) = -0.866, sin(150 deg) = 0.5
+        cos_val = -0.866
+        sin_val = 0.5
+        
+        rx1 = ux * cos_val - uy * sin_val
+        ry1 = ux * sin_val + uy * cos_val
+        
+        rx2 = ux * cos_val - uy * (-sin_val)
+        ry2 = ux * (-sin_val) + uy * cos_val
+        
+        w1_x = x2 + arrow_size * rx1
+        w1_y = y2 + arrow_size * ry1
+        
+        w2_x = x2 + arrow_size * rx2
+        w2_y = y2 + arrow_size * ry2
+        
+        # Define paths for the shaft and two wings
+        shaft = [(x1, y1), (x2, y2)]
+        wing1 = [(x2, y2), (w1_x, w1_y)]
+        wing2 = [(x2, y2), (w2_x, w2_y)]
+        
+        annot = page.add_ink_annot([shaft, wing1, wing2])
+        annot.set_colors(stroke=color_rgb)
+        annot.set_border(width=width)
+        annot.update()
+
 
     def get_freetext_fontsize(self, annot):
         """
@@ -195,24 +268,40 @@ class PDFDocument:
         return False
 
     def save(self, output_path=None):
-        """Saves the document. Overwrites if output_path is None."""
+        """Saves the document. Uses incremental save if output_path is None or matches filepath."""
         target = output_path if output_path else self.filepath
         
-        # Save to a temporary file first, then replace (prevents corruption if save fails)
+        # If saving to the same file, do a super fast incremental save
+        if target == self.filepath:
+            try:
+                self.doc.save(self.doc.name, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+                return True
+            except Exception as e:
+                print(f"Incremental save failed: {e}. Falling back to full save...")
+                
+        # Otherwise, save to a different path or fall back to full save
         temp_path = target + ".tmp"
         try:
-            self.doc.save(temp_path, garbage=3, deflate=True)
-            self.doc.close()
+            # Save using garbage=1 (fast cleaning) instead of garbage=3 to avoid freezing
+            self.doc.save(temp_path, garbage=1, deflate=True)
             
-            # Replace old file with new one
-            if os.path.exists(target):
-                os.remove(target)
-            os.rename(temp_path, target)
-            
-            # Reopen the document
-            self.doc = fitz.open(target)
+            if target == self.filepath:
+                # If we are overwriting the active file (fallback case), we must close and reopen
+                self.doc.close()
+                if os.path.exists(target):
+                    os.remove(target)
+                os.rename(temp_path, target)
+                self.doc = fitz.open(target)
+            else:
+                # Saving to a new copy
+                if os.path.exists(target):
+                    os.remove(target)
+                os.rename(temp_path, target)
             return True
         except Exception as e:
             if os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
             raise e

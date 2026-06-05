@@ -1,6 +1,6 @@
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem, QGraphicsLineItem
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QBrush, QFont
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QRectF, QPointF
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QRectF, QPointF, QLineF
 import fitz
 import time
 from app.state import Tool
@@ -126,6 +126,7 @@ class PDFViewer(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setStyleSheet("background-color: #111827; border: none;") # Gray 900 background
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         # Tool state variables
         self.drawing = False
@@ -374,7 +375,7 @@ class PDFViewer(QGraphicsView):
             self.active_path = QPainterPath()
             self.active_path.moveTo(scene_pos)
             
-            pen = QPen(QColor(*self.state.active_color_rgb), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            pen = QPen(QColor(*self.state.active_color_rgb), self.state.active_line_width * self.zoom, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             self.temp_path_item = self._scene.addPath(self.active_path, pen)
             
         elif tool in (Tool.HIGHLIGHT, Tool.SELECT):
@@ -494,6 +495,11 @@ class PDFViewer(QGraphicsView):
         elif tool == Tool.ERASER:
             self.drawing = True
             self.erase_at(page_item.page_num, local_pos)
+            
+        elif tool in (Tool.SQUARE, Tool.ARROW):
+            self.drawing = True
+            self.drag_start_local_pos = local_pos
+            self.drag_start_scene_pos = scene_pos
 
     def mouseMoveEvent(self, event):
         if not self.pdf_doc or not self.page_items:
@@ -602,6 +608,99 @@ class PDFViewer(QGraphicsView):
                     
         elif tool == Tool.ERASER:
             self.erase_at(self.active_page_num, local_pos)
+            
+        elif tool == Tool.SQUARE:
+            # Draw a temporary rectangle outline in scene coordinates
+            x0 = min(self.drag_start_scene_pos.x(), scene_pos.x())
+            y0 = min(self.drag_start_scene_pos.y(), scene_pos.y())
+            w = abs(self.drag_start_scene_pos.x() - scene_pos.x())
+            h = abs(self.drag_start_scene_pos.y() - scene_pos.y())
+            scene_rect = QRectF(x0, y0, w, h)
+            
+            if (not hasattr(self, 'temp_shape_item') or 
+                self.temp_shape_item is None or 
+                not isinstance(self.temp_shape_item, QGraphicsRectItem)):
+                if hasattr(self, 'temp_shape_item') and self.temp_shape_item is not None:
+                    try:
+                        self._scene.removeItem(self.temp_shape_item)
+                    except Exception:
+                        pass
+                self.temp_shape_item = QGraphicsRectItem(scene_rect)
+                pen = QPen(QColor(*self.state.active_color_rgb), self.state.active_line_width * self.zoom, Qt.PenStyle.SolidLine)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                self.temp_shape_item.setPen(pen)
+                self.temp_shape_item.setZValue(1000.0)
+                self._scene.addItem(self.temp_shape_item)
+            else:
+                self.temp_shape_item.setRect(scene_rect)
+                
+        elif tool == Tool.ARROW:
+            # Draw a temporary arrow in scene coordinates using QPainterPath
+            p1 = self.drag_start_scene_pos
+            p2 = scene_pos
+            
+            dx = p2.x() - p1.x()
+            dy = p2.y() - p1.y()
+            length = (dx**2 + dy**2)**0.5
+            
+            path = QPainterPath()
+            if length > 0:
+                ux = dx / length
+                uy = dy / length
+                
+                # Proportional arrowhead size math scaled by zoom
+                width = self.state.active_line_width * self.zoom
+                base_size = 6.0 * self.zoom + 1.5 * width
+                base_size = min(base_size, 18.0 * self.zoom)
+                arrow_size = min(base_size, length * 0.3)
+                if length > 10 * self.zoom:
+                    arrow_size = max(arrow_size, 5.0 * self.zoom)
+                
+                # Rotate vectors by 150 degrees (30 degrees from back shaft)
+                cos_val = -0.866
+                sin_val = 0.5
+                
+                rx1 = ux * cos_val - uy * sin_val
+                ry1 = ux * sin_val + uy * cos_val
+                
+                rx2 = ux * cos_val - uy * (-sin_val)
+                ry2 = ux * (-sin_val) + uy * cos_val
+                
+                w1_x = p2.x() + arrow_size * rx1
+                w1_y = p2.y() + arrow_size * ry1
+                
+                w2_x = p2.x() + arrow_size * rx2
+                w2_y = p2.y() + arrow_size * ry2
+                
+                # Construct path: shaft + wing1 + wing2
+                path.moveTo(p1)
+                path.lineTo(p2)
+                path.moveTo(p2)
+                path.lineTo(QPointF(w1_x, w1_y))
+                path.moveTo(p2)
+                path.lineTo(QPointF(w2_x, w2_y))
+            else:
+                path.moveTo(p1)
+                path.lineTo(p2)
+                
+            if (not hasattr(self, 'temp_shape_item') or 
+                self.temp_shape_item is None or 
+                not isinstance(self.temp_shape_item, QGraphicsPathItem)):
+                if hasattr(self, 'temp_shape_item') and self.temp_shape_item is not None:
+                    try:
+                        self._scene.removeItem(self.temp_shape_item)
+                    except Exception:
+                        pass
+                self.temp_shape_item = QGraphicsPathItem(path)
+                pen = QPen(QColor(*self.state.active_color_rgb), self.state.active_line_width * self.zoom, Qt.PenStyle.SolidLine)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                self.temp_shape_item.setPen(pen)
+                self.temp_shape_item.setZValue(1000.0)
+                self._scene.addItem(self.temp_shape_item)
+            else:
+                self.temp_shape_item.setPath(path)
 
     def cleanup_temp_rect(self):
         if hasattr(self, 'temp_rect_item') and self.temp_rect_item is not None:
@@ -610,6 +709,13 @@ class PDFViewer(QGraphicsView):
             except Exception:
                 pass
             self.temp_rect_item = None
+            
+        if hasattr(self, 'temp_shape_item') and self.temp_shape_item is not None:
+            try:
+                self._scene.removeItem(self.temp_shape_item)
+            except Exception:
+                pass
+            self.temp_shape_item = None
 
     def mouseReleaseEvent(self, event):
         if not self.pdf_doc or not self.page_items:
@@ -745,10 +851,55 @@ class PDFViewer(QGraphicsView):
                 self.pdf_doc.add_pen_annotation(
                     self.active_page_num, 
                     self.current_stroke_points, 
-                    self.state.active_color_pdf
+                    self.state.active_color_pdf,
+                    width=self.state.active_line_width
                 )
                 self.page_items[self.active_page_num].reload_page()
                 self.document_modified.emit()
+                
+        elif tool in (Tool.SQUARE, Tool.ARROW):
+            if hasattr(self, 'temp_shape_item') and self.temp_shape_item is not None:
+                try:
+                    self._scene.removeItem(self.temp_shape_item)
+                except Exception:
+                    pass
+                self.temp_shape_item = None
+                
+            if self.active_page_num != -1:
+                active_item = self.page_items[self.active_page_num]
+                local_pos = scene_pos - active_item.pos()
+                
+                p1_pdf = self.get_pdf_point(self.drag_start_local_pos)
+                p2_pdf = self.get_pdf_point(local_pos)
+                
+                if tool == Tool.SQUARE:
+                    x0 = min(p1_pdf.x, p2_pdf.x)
+                    y0 = min(p1_pdf.y, p2_pdf.y)
+                    x1 = max(p1_pdf.x, p2_pdf.x)
+                    y1 = max(p1_pdf.y, p2_pdf.y)
+                    pdf_rect = fitz.Rect(x0, y0, x1, y1)
+                    if pdf_rect.width > 2 and pdf_rect.height > 2:
+                        self.pdf_doc.add_square_annotation(
+                            self.active_page_num,
+                            pdf_rect,
+                            self.state.active_color_pdf,
+                            width=self.state.active_line_width
+                        )
+                        self.page_items[self.active_page_num].reload_page()
+                        self.document_modified.emit()
+                        
+                elif tool == Tool.ARROW:
+                    dist = ((p1_pdf.x - p2_pdf.x)**2 + (p1_pdf.y - p2_pdf.y)**2)**0.5
+                    if dist > 2:
+                        self.pdf_doc.add_arrow_annotation(
+                            self.active_page_num,
+                            p1_pdf,
+                            p2_pdf,
+                            self.state.active_color_pdf,
+                            width=self.state.active_line_width
+                        )
+                        self.page_items[self.active_page_num].reload_page()
+                        self.document_modified.emit()
                 
         elif tool == Tool.HIGHLIGHT:
             self.apply_highlight_to_selection()
