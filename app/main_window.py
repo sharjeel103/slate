@@ -1,7 +1,125 @@
-from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar, QFileDialog, QLabel, QScrollArea, QStatusBar, QPushButton, QButtonGroup, QSizePolicy, QSpinBox, QSplitter, QTreeWidget, QTreeWidgetItem
+from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar, QFileDialog, QLabel, QScrollArea, QStatusBar, QPushButton, QButtonGroup, QSizePolicy, QSpinBox, QSplitter, QTreeWidget, QTreeWidgetItem, QLineEdit
 from PyQt6.QtGui import QAction, QKeySequence, QIcon, QColor, QFont
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
 import os
+
+class SearchLineEdit(QLineEdit):
+    esc_pressed = pyqtSignal()
+    shift_enter_pressed = pyqtSignal()
+    enter_pressed = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.esc_pressed.emit()
+            event.accept()
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.shift_enter_pressed.emit()
+            else:
+                self.enter_pressed.emit()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+class PDFSearchBar(QWidget):
+    search_requested = pyqtSignal(str)
+    next_match = pyqtSignal()
+    prev_match = pyqtSignal()
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SearchBar")
+        
+        self.setStyleSheet("""
+            QWidget#SearchBar {
+                background-color: #1f2937; /* Gray 800 */
+                border: 1px solid #374151; /* Gray 700 */
+                border-radius: 8px;
+            }
+            QLineEdit {
+                background-color: #374151; /* Gray 700 */
+                color: #f3f4f6; /* Gray 100 */
+                border: 1px solid #4b5563; /* Gray 600 */
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 13px;
+                min-width: 180px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #3b82f6; /* Blue 500 */
+            }
+            QLabel {
+                color: #9ca3af; /* Gray 400 */
+                font-size: 12px;
+                margin: 0 8px;
+            }
+            QPushButton {
+                background-color: transparent;
+                color: #d1d5db; /* Gray 300 */
+                border: none;
+                border-radius: 4px;
+                min-width: 24px;
+                max-width: 24px;
+                min-height: 24px;
+                max-height: 24px;
+                padding: 0;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #374151; /* Gray 700 */
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: #4b5563; /* Gray 600 */
+            }
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self.input_field = SearchLineEdit(self)
+        self.input_field.setPlaceholderText("Find in document...")
+        layout.addWidget(self.input_field)
+
+        self.status_label = QLabel("0 of 0", self)
+        layout.addWidget(self.status_label)
+
+        self.btn_prev = QPushButton("↑", self)
+        self.btn_prev.setToolTip("Previous match (Shift+Enter)")
+        layout.addWidget(self.btn_prev)
+
+        self.btn_next = QPushButton("↓", self)
+        self.btn_next.setToolTip("Next match (Enter)")
+        layout.addWidget(self.btn_next)
+
+        self.btn_close = QPushButton("✕", self)
+        self.btn_close.setToolTip("Close search (Esc)")
+        layout.addWidget(self.btn_close)
+
+        self.input_field.textChanged.connect(self.on_text_changed)
+        self.input_field.enter_pressed.connect(self.next_match.emit)
+        self.input_field.shift_enter_pressed.connect(self.prev_match.emit)
+        self.input_field.esc_pressed.connect(self.close_search)
+        
+        self.btn_prev.clicked.connect(self.prev_match.emit)
+        self.btn_next.clicked.connect(self.next_match.emit)
+        self.btn_close.clicked.connect(self.close_search)
+
+    def on_text_changed(self, text):
+        self.search_requested.emit(text)
+
+    def update_status(self, current, total):
+        if total == 0:
+            self.status_label.setText("0 of 0")
+        else:
+            self.status_label.setText(f"{current} of {total}")
+
+    def close_search(self):
+        self.hide()
+        self.closed.emit()
+
 
 from app.state import AppState, Tool, COLORS
 from app.annotator import PDFDocument
@@ -13,6 +131,7 @@ class MainWindow(QMainWindow):
         self.state = AppState()
         self.pdf_doc = None
         self.is_dirty = False
+        self.pre_ctrl_tool = None
         
         self.setWindowTitle("Slate")
         self.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "app_icon.png")))
@@ -117,6 +236,7 @@ class MainWindow(QMainWindow):
         self.outline_tree = QTreeWidget(self)
         self.outline_tree.setHeaderHidden(True)
         self.outline_tree.setObjectName("outline_tree")
+        self.outline_tree.installEventFilter(self)
         self.outline_tree.setStyleSheet("""
             QTreeWidget#outline_tree {
                 background-color: #1f2937;
@@ -240,8 +360,15 @@ class MainWindow(QMainWindow):
         outline_action.triggered.connect(self.toggle_outline)
         self.addAction(outline_action)
 
+        # Search Shortcut (Ctrl+F)
+        search_action = QAction("Find...", self)
+        search_action.setShortcut(QKeySequence("Ctrl+F"))
+        search_action.triggered.connect(self.viewer.show_search_bar)
+        self.addAction(search_action)
+
     def create_toolbars(self):
         toolbar = QToolBar("Tools", self)
+        toolbar.setObjectName("Tools")
         toolbar.setMovable(False)
         toolbar.setOrientation(Qt.Orientation.Vertical)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, toolbar)
@@ -644,11 +771,42 @@ class MainWindow(QMainWindow):
             
         self.outline_tree.expandToDepth(1)
 
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self.outline_tree and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+                item = self.outline_tree.currentItem()
+                if item:
+                    self.on_outline_item_clicked(item, 0)
+                return True
+            # If user presses F9, O, 0, or Escape, toggle/close outline
+            elif key in (Qt.Key.Key_F9, Qt.Key.Key_O, Qt.Key.Key_0, Qt.Key.Key_Escape):
+                self.toggle_outline()
+                return True
+            # Let J/K/Shift+J/Shift+K scroll/page-nav the PDF viewer even if the outline has focus
+            elif key == Qt.Key.Key_J:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.viewer.next_page()
+                else:
+                    bar = self.viewer.verticalScrollBar()
+                    bar.setValue(bar.value() + bar.singleStep() * 3)
+                return True
+            elif key == Qt.Key.Key_K:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.viewer.prev_page()
+                else:
+                    bar = self.viewer.verticalScrollBar()
+                    bar.setValue(bar.value() - bar.singleStep() * 3)
+                return True
+        return super().eventFilter(obj, event)
+
     def on_outline_item_clicked(self, item, column):
         page_num = item.data(0, Qt.ItemDataRole.UserRole)
         if page_num is not None and self.pdf_doc:
             target_idx = max(0, min(page_num - 1, self.pdf_doc.page_count - 1))
             self.viewer.scroll_to_page(target_idx)
+            self.viewer.setFocus()
 
     def toggle_outline(self):
         sizes = self.splitter.sizes()
@@ -657,11 +815,13 @@ class MainWindow(QMainWindow):
             self.show_status_message("Show Outline")
             if hasattr(self, 'btn_outline'):
                 self.btn_outline.setChecked(True)
+            self.outline_tree.setFocus()
         else:
             self.splitter.setSizes([0, 1100])
             self.show_status_message("Hide Outline")
             if hasattr(self, 'btn_outline'):
                 self.btn_outline.setChecked(False)
+            self.viewer.setFocus()
 
     def on_splitter_moved(self, pos, index):
         if index == 1:
@@ -702,12 +862,19 @@ class MainWindow(QMainWindow):
             self.outline_tree.blockSignals(False)
 
     def keyPressEvent(self, event):
-        # Handle custom tool shortcuts: V, H, P, T, E (case-insensitive)
         key = event.key()
         
-        # Block shortcuts if editing text
-        if self.viewer.active_text_widget:
+        # Block shortcuts if editing text or search bar is focused
+        if self.viewer.active_text_widget or (self.viewer.search_bar and self.viewer.search_bar.input_field.hasFocus()):
             super().keyPressEvent(event)
+            return
+
+        if key == Qt.Key.Key_Control:
+            if not event.isAutoRepeat():
+                if self.pre_ctrl_tool is None:
+                    self.pre_ctrl_tool = self.state.active_tool
+                    self.set_tool(Tool.ERASER)
+            event.accept()
             return
 
         if key == Qt.Key.Key_V:
@@ -728,14 +895,22 @@ class MainWindow(QMainWindow):
             self.toggle_rect_select_mode()
         elif key in (Qt.Key.Key_O, Qt.Key.Key_0, Qt.Key.Key_F9):
             self.toggle_outline()
+        elif key == Qt.Key.Key_Slash:
+            self.viewer.show_search_bar()
 
-        # Vim-style scrolling (J down, K up)
+        # Vim-style scrolling (J down, K up, Shift+J next page, Shift+K prev page)
         elif key == Qt.Key.Key_J:
-            bar = self.viewer.verticalScrollBar()
-            bar.setValue(bar.value() + bar.singleStep() * 3)
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.viewer.next_page()
+            else:
+                bar = self.viewer.verticalScrollBar()
+                bar.setValue(bar.value() + bar.singleStep() * 3)
         elif key == Qt.Key.Key_K:
-            bar = self.viewer.verticalScrollBar()
-            bar.setValue(bar.value() - bar.singleStep() * 3)
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.viewer.prev_page()
+            else:
+                bar = self.viewer.verticalScrollBar()
+                bar.setValue(bar.value() - bar.singleStep() * 3)
 
         elif key == Qt.Key.Key_1:
             self.set_color(1)
@@ -756,3 +931,18 @@ class MainWindow(QMainWindow):
             
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        # Block if editing text or search bar is focused
+        if self.viewer.active_text_widget or (self.viewer.search_bar and self.viewer.search_bar.input_field.hasFocus()):
+            super().keyReleaseEvent(event)
+            return
+
+        if event.key() == Qt.Key.Key_Control:
+            if not event.isAutoRepeat():
+                if hasattr(self, 'pre_ctrl_tool') and self.pre_ctrl_tool is not None:
+                    self.set_tool(self.pre_ctrl_tool)
+                    self.pre_ctrl_tool = None
+            event.accept()
+            return
+        super().keyReleaseEvent(event)

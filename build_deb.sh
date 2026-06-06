@@ -28,7 +28,12 @@ rm -rf build/ dist/ debian-build/ "${NAME}_"*_amd64.deb
 
 # 2. Build executable using PyInstaller
 echo "Running PyInstaller..."
-./venv/bin/pyinstaller --noconfirm --onedir --windowed \
+PYINSTALLER_CMD="./venv/bin/pyinstaller"
+if [ ! -f "$PYINSTALLER_CMD" ]; then
+    PYINSTALLER_CMD="pyinstaller"
+fi
+
+$PYINSTALLER_CMD --noconfirm --onedir --windowed \
   --add-data "app/app_icon.png:app" \
   --name "$NAME" \
   main.py

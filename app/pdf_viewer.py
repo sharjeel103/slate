@@ -1,9 +1,45 @@
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem, QGraphicsLineItem
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QBrush, QFont
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QRectF, QPointF, QLineF
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QBrush, QFont, QDesktopServices
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QRectF, QPointF, QLineF, QUrl, QThread, QTimer
 import fitz
 import time
 from app.state import Tool
+
+class PDFSearchWorker(QThread):
+    progress = pyqtSignal(int, list)  # page_num, list of fitz.Rect matches
+    finished = pyqtSignal(dict)       # final dictionary of {page_num: [fitz.Rect, ...]}
+
+    def __init__(self, doc_path, query, parent=None):
+        super().__init__(parent)
+        self.doc_path = doc_path
+        self.query = query
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        results = {}
+        if not self.query or not self.doc_path:
+            self.finished.emit(results)
+            return
+
+        try:
+            doc = fitz.open(self.doc_path)
+            for page_num in range(len(doc)):
+                if self._is_cancelled:
+                    break
+                page = doc[page_num]
+                rects = page.search_for(self.query)
+                if rects:
+                    results[page_num] = rects
+                    self.progress.emit(page_num, rects)
+            doc.close()
+        except Exception as e:
+            print(f"Error during search: {e}")
+        
+        if not self._is_cancelled:
+            self.finished.emit(results)
 
 class TextInputWidget(QTextEdit):
     editing_done = pyqtSignal(object, object)  # text, widget
@@ -104,6 +140,26 @@ class PDFPageItem(QGraphicsRectItem):
         self.unload_page()
         self.load_page()
 
+    def get_link_at(self, local_pos):
+        """Returns the PyMuPDF link dictionary if local_pos (scene page-local) is over a link."""
+        if not self.pdf_doc or not self.pdf_doc.doc:
+            return None
+        # Convert local pos to PDF points
+        zoom = self.zoom
+        pdf_x = local_pos.x() / zoom
+        pdf_y = local_pos.y() / zoom
+        pdf_point = fitz.Point(pdf_x, pdf_y)
+        
+        # Get links on this page
+        try:
+            links = self.pdf_doc.doc[self.page_num].get_links()
+            for link in links:
+                if link.get("from") and link["from"].contains(pdf_point):
+                    return link
+        except Exception:
+            pass
+        return None
+
 class PDFViewer(QGraphicsView):
     page_changed = pyqtSignal(int, int)  # current, total
     zoom_changed = pyqtSignal(float)     # zoom percentage factor
@@ -159,11 +215,28 @@ class PDFViewer(QGraphicsView):
         # In-place Text widget
         self.active_text_widget = None
 
+        # Search state variables
+        self.search_bar = None
+        self.search_worker = None
+        self.search_highlights = {}  # page_num: [QGraphicsRectItem, ...]
+        self.flat_highlight_items = []
+        self.search_matches = []  # list of tuples: (page_num, fitz.Rect)
+        self.current_match_idx = -1
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.trigger_search)
+        self.pending_search_query = ""
+        self.running_workers = set()
+
         # Enable mouse tracking for hover cursor updates
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
 
     def set_document(self, pdf_doc):
+        if hasattr(self, 'search_bar') and self.search_bar:
+            self.search_bar.hide()
+            self.clear_search()
+
         self.pdf_doc = pdf_doc
         self.page_items.clear()
         self._scene.clear()
@@ -314,6 +387,7 @@ class PDFViewer(QGraphicsView):
         self.scroll_to_page(active_page)
         self.update_visible_pages()
         self.zoom_changed.emit(self.zoom)
+        self.update_search_highlights_zoom()
 
     def get_page_under_pos(self, scene_pos):
         """Finds the PDFPageItem containing the scene position, returning (item, page_local_pos)."""
@@ -342,7 +416,17 @@ class PDFViewer(QGraphicsView):
 
         self.active_page_num = page_item.page_num
         tool = self.state.active_tool
-        
+        # For SELECT tool, check if we clicked on a hyperlink/document link
+        if tool == Tool.SELECT:
+            link = page_item.get_link_at(local_pos)
+            if link:
+                if "page" in link and link["page"] is not None and link["page"] >= 0:
+                    self.scroll_to_page(link["page"])
+                elif link.get("kind") == fitz.LINK_URI:
+                    QDesktopServices.openUrl(QUrl(link["uri"]))
+                event.accept()
+                return
+
         # For SELECT and TEXT tools, check first if we clicked on an existing FreeText annotation for editing/dragging
         if tool in (Tool.SELECT, Tool.TEXT):
             pdf_point = self.get_pdf_point(local_pos)
@@ -1176,6 +1260,9 @@ class PDFViewer(QGraphicsView):
 
         if tool in (Tool.SELECT, Tool.HIGHLIGHT):
             if page_item:
+                if tool == Tool.SELECT and page_item.get_link_at(local_pos) is not None:
+                    self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+                    return
                 over_text = self.is_pos_over_any_word(page_item.page_num, local_pos) or self.is_pos_over_any_freetext(page_item.page_num, local_pos)
                 if over_text:
                     self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
@@ -1199,3 +1286,216 @@ class PDFViewer(QGraphicsView):
 
     def keyPressEvent(self, event):
         super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.position_search_bar()
+
+    def show_search_bar(self):
+        if not self.pdf_doc:
+            return
+        
+        if not self.search_bar:
+            from app.main_window import PDFSearchBar
+            self.search_bar = PDFSearchBar(self)
+            self.search_bar.search_requested.connect(self.start_search)
+            self.search_bar.next_match.connect(lambda: self.navigate_search_match("next"))
+            self.search_bar.prev_match.connect(lambda: self.navigate_search_match("prev"))
+            self.search_bar.closed.connect(self.clear_search)
+            
+        self.search_bar.show()
+        self.position_search_bar()
+        self.search_bar.input_field.setFocus()
+        self.search_bar.input_field.selectAll()
+
+    def position_search_bar(self):
+        if hasattr(self, 'search_bar') and self.search_bar and self.search_bar.isVisible():
+            sb_w = 380
+            sb_h = self.search_bar.sizeHint().height() or 40
+            v_width = self.viewport().width()
+            x = v_width - sb_w - 15
+            y = 15
+            x = max(10, x)
+            self.search_bar.setGeometry(x, y, sb_w, sb_h)
+
+    def start_search(self, query):
+        self.pending_search_query = query
+        self.search_timer.start(800)  # Wait for 800ms of inactivity before triggering
+
+    def trigger_search(self):
+        query = self.pending_search_query
+        # Cancel current search asynchronously
+        if hasattr(self, 'search_worker') and self.search_worker:
+            old_worker = self.search_worker
+            old_worker.cancel()
+            try:
+                old_worker.progress.disconnect()
+                old_worker.finished.disconnect()
+            except TypeError:
+                pass
+            # Make sure it discards itself from tracking set when it finishes in the background
+            old_worker.finished.connect(lambda w=old_worker: self.running_workers.discard(w))
+            self.search_worker = None
+
+        # Clear search highlights
+        for items in self.search_highlights.values():
+            for item in items:
+                if item.scene():
+                    self.scene().removeItem(item)
+        self.search_highlights.clear()
+        self.flat_highlight_items = []
+        self.search_matches = []
+        self.current_match_idx = -1
+
+        if not query or not self.pdf_doc:
+            if self.search_bar:
+                self.search_bar.update_status(0, 0)
+            return
+
+        # Start background search thread
+        worker = PDFSearchWorker(self.pdf_doc.filepath, query, self)
+        worker.progress.connect(self.on_search_progress)
+        worker.finished.connect(self.on_search_finished)
+        worker.finished.connect(lambda: self.running_workers.discard(worker))
+        self.running_workers.add(worker)
+        self.search_worker = worker
+        worker.start()
+
+    def on_search_progress(self, page_num, rects):
+        if not self.pdf_doc or page_num >= len(self.page_items):
+            return
+            
+        page_item = self.page_items[page_num]
+        zoom = self.zoom
+        
+        for r in rects:
+            self.search_matches.append((page_num, r))
+            
+            local_rect = QRectF(r.x0 * zoom, r.y0 * zoom, r.width * zoom, r.height * zoom)
+            highlight_item = QGraphicsRectItem(local_rect, page_item)
+            highlight_item.setBrush(QBrush(QColor(255, 255, 0, 76)))
+            highlight_item.setPen(QPen(Qt.PenStyle.NoPen))
+            highlight_item.setZValue(2.0)
+            
+            if page_num not in self.search_highlights:
+                self.search_highlights[page_num] = []
+            self.search_highlights[page_num].append(highlight_item)
+            self.flat_highlight_items.append(highlight_item)
+
+        # If this is the first progress callback, highlight the first match
+        if self.current_match_idx == -1 and len(self.search_matches) > 0:
+            self.current_match_idx = 0
+            self.highlight_active_match()
+            
+        if self.search_bar:
+            self.search_bar.update_status(self.current_match_idx + 1 if self.current_match_idx >= 0 else 0, len(self.search_matches))
+
+    def on_search_finished(self, results):
+        total = len(self.search_matches)
+        if total == 0:
+            self.status_message.emit("No matches found")
+            if self.search_bar:
+                self.search_bar.update_status(0, 0)
+        else:
+            self.status_message.emit(f"Search finished: {total} matches found")
+
+    def navigate_search_match(self, direction):
+        if not self.search_matches:
+            return
+        
+        if direction == "next":
+            self.current_match_idx = (self.current_match_idx + 1) % len(self.search_matches)
+        else:
+            self.current_match_idx = (self.current_match_idx - 1) % len(self.search_matches)
+            
+        self.highlight_active_match()
+        if self.search_bar:
+            self.search_bar.update_status(self.current_match_idx + 1, len(self.search_matches))
+
+    def highlight_active_match(self):
+        if not self.search_matches or self.current_match_idx < 0 or self.current_match_idx >= len(self.search_matches):
+            return
+
+        # Reset colors of all highlight items to standard yellow
+        for item in self.flat_highlight_items:
+            item.setBrush(QBrush(QColor(255, 255, 0, 76)))
+            item.setPen(QPen(Qt.PenStyle.NoPen))
+            item.setZValue(2.0)
+            
+        # Highlight the current active match in orange
+        if self.current_match_idx < len(self.flat_highlight_items):
+            active_item = self.flat_highlight_items[self.current_match_idx]
+            active_item.setBrush(QBrush(QColor(249, 115, 22, 128))) # Orange 50% opacity
+            active_item.setPen(QPen(QColor("#f97316"), 1))
+            active_item.setZValue(3.0) # Bring to front
+        
+        # Center view on active match
+        page_num, rect = self.search_matches[self.current_match_idx]
+        page_item = self.page_items[page_num]
+        zoom = self.zoom
+        scene_rect = QRectF(
+            page_item.pos().x() + rect.x0 * zoom,
+            page_item.pos().y() + rect.y0 * zoom,
+            rect.width * zoom,
+            rect.height * zoom
+        )
+        self.centerOn(scene_rect.center())
+
+    def clear_search(self):
+        self.search_timer.stop()
+        if hasattr(self, 'search_worker') and self.search_worker:
+            old_worker = self.search_worker
+            old_worker.cancel()
+            try:
+                old_worker.progress.disconnect()
+                old_worker.finished.disconnect()
+            except TypeError:
+                pass
+            old_worker.finished.connect(lambda w=old_worker: self.running_workers.discard(w))
+            self.search_worker = None
+
+        # Remove all highlights from the scene/pages
+        for page_num, items in self.search_highlights.items():
+            for item in items:
+                if item.scene():
+                    self.scene().removeItem(item)
+        self.search_highlights.clear()
+        self.flat_highlight_items = []
+        self.search_matches = []
+        self.current_match_idx = -1
+        self.status_message.emit("Search cleared")
+
+    def update_search_highlights_zoom(self):
+        # Remove old highlights
+        for page_num, items in self.search_highlights.items():
+            for item in items:
+                if item.scene():
+                    self.scene().removeItem(item)
+        self.search_highlights.clear()
+        self.flat_highlight_items = []
+        
+        if not self.search_matches:
+            return
+            
+        # Recreate highlights with the new zoom factor
+        for page_num, r in self.search_matches:
+            page_item = self.page_items[page_num]
+            zoom = self.zoom
+            local_rect = QRectF(r.x0 * zoom, r.y0 * zoom, r.width * zoom, r.height * zoom)
+            
+            highlight_item = QGraphicsRectItem(local_rect, page_item)
+            highlight_item.setBrush(QBrush(QColor(255, 255, 0, 76)))
+            highlight_item.setPen(QPen(Qt.PenStyle.NoPen))
+            highlight_item.setZValue(2.0)
+            
+            if page_num not in self.search_highlights:
+                self.search_highlights[page_num] = []
+            self.search_highlights[page_num].append(highlight_item)
+            self.flat_highlight_items.append(highlight_item)
+            
+        # Re-apply active match highlight
+        if self.current_match_idx >= 0 and self.current_match_idx < len(self.flat_highlight_items):
+            active_item = self.flat_highlight_items[self.current_match_idx]
+            active_item.setBrush(QBrush(QColor(249, 115, 22, 128)))
+            active_item.setPen(QPen(QColor("#f97316"), 1))
+            active_item.setZValue(3.0)
