@@ -83,7 +83,7 @@ def create_pdf():
         ("S", "Square Mode (Vector rectangles)"),
         ("A", "Arrow Mode (Vector directional arrows)"),
         ("E", "Eraser Mode (Click/drag to delete annotations)"),
-        ("Hold Ctrl", "Temporary Eraser toggle (reverts back to active tool on release)")
+        ("Hold Ctrl + Shift", "Temporary Eraser toggle (reverts back to active tool on release)")
     ]
     for key, desc in tools:
         page2.insert_text((70, y), f"•  {key}", fontsize=10, color=(0.1, 0.5, 0.8))

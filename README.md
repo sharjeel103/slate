@@ -39,7 +39,7 @@
 | **`S`** | **Square** | Draw a rectangle/square outline shape. |
 | **`A`** | **Arrow** | Draw an arrow shape. |
 | **`E`** | **Eraser** | Click/drag over any annotation to delete it. |
-| **`Hold Ctrl`** | **Temporary Eraser** | Press and hold `Ctrl` to erase; release to return to active tool. |
+| **`Hold Ctrl + Shift`** | **Temporary Eraser** | Press and hold `Ctrl + Shift` to erase; release to return to active tool. |
 | **`R`** | **Rect Selection** | Toggle rectangle-box selection mode on/off. |
 | **`1` - `5`** | **Colors** | Yellow (`1`), Blue (`2`), Green (`3`), Red (`4`), Black (`5`). |
 | **`Ctrl + F` / `/`** | **Search Document** | Open floating search bar. `Enter` (Next), `Shift + Enter` (Prev), `Esc` (Close). |

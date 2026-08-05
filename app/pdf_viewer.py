@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem, QGraphicsLineItem
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem, QGraphicsLineItem, QFrame, QHBoxLayout, QWidget, QGraphicsTextItem
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QBrush, QFont, QDesktopServices
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QRectF, QPointF, QLineF, QUrl, QThread, QTimer
 import fitz
@@ -41,52 +41,149 @@ class PDFSearchWorker(QThread):
         if not self._is_cancelled:
             self.finished.emit(results)
 
-class TextInputWidget(QTextEdit):
-    editing_done = pyqtSignal(object, object)  # text, widget
+class TextResizeHandle(QWidget):
+    def __init__(self, parent_container, is_left):
+        super().__init__(parent_container)
+        self.parent_container = parent_container
+        self.is_left = is_left
+        self.setFixedWidth(8)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setStyleSheet("background-color: #3b82f6; border-radius: 4px;")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.drag_start_x = 0
+        self.start_geometry = None
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start_x = event.globalPosition().x()
+            self.start_geometry = self.parent_container.geometry()
+            self.parent_container.auto_width = False
+            self.parent_container.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            dx = event.globalPosition().x() - self.drag_start_x
+            geo = self.start_geometry
+            
+            if self.is_left:
+                new_width = max(self.parent_container.min_width, geo.width() - dx)
+                new_x = geo.x() + (geo.width() - new_width)
+                self.parent_container.setGeometry(int(new_x), geo.y(), int(new_width), geo.height())
+            else:
+                new_width = max(self.parent_container.min_width, geo.width() + dx)
+                self.parent_container.setGeometry(geo.x(), geo.y(), int(new_width), geo.height())
+                
+            self.parent_container.text_edit.adjust_height_from_layout(self.parent_container.text_edit.document().documentLayout().documentSize())
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.parent_container.text_edit.setFocus()
+            event.accept()
+
+class InnerTextInputWidget(QTextEdit):
+    def __init__(self, parent_container):
+        super().__init__(parent_container)
+        self.parent_container = parent_container
         self.setFrameStyle(0)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.document().setDocumentMargin(0)  # Remove internal margins for exact positioning
-        self._committed = False
-        
-        # State variables
-        self.scene_pos = None
-        self.page_num = -1
-        self.editing_annot_rect = None
-        self.editing_annot_page = -1
-        self.color_pdf = (0.0, 0.0, 0.0)
-        self.font_size = 12
+        self.document().setDocumentMargin(0)
         
         self.document().documentLayout().documentSizeChanged.connect(self.adjust_height_from_layout)
 
     def adjust_height_from_layout(self, size):
         new_height = max(30, int(size.height()) + 10)
         self.setFixedHeight(new_height)
+        self.parent_container.adjust_size()
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
-        self.commit()
+        if self.parent_container.left_handle.underMouse() or self.parent_container.right_handle.underMouse():
+            return
+        self.parent_container.commit()
 
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                super().keyPressEvent(event)
-            else:
-                self.commit()
-        elif event.key() == Qt.Key.Key_Escape:
-            self._committed = True
-            self.editing_done.emit(None, self)
+        if event.key() == Qt.Key.Key_Escape:
+            self.parent_container.commit()
         else:
             super().keyPressEvent(event)
+
+class TextInputWidget(QFrame):
+    editing_done = pyqtSignal(object, object)  # text, widget (self)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.Shape.NoFrame)
+        self.setStyleSheet("TextInputWidget { background: transparent; border: none; }")
+        
+        # State variables
+        self._committed = False
+        self.scene_pos = None
+        self.page_num = -1
+        self.editing_annot_rect = None
+        self.editing_annot_page = -1
+        self.color_pdf = (0.0, 0.0, 0.0)
+        self.font_size = 12
+        self.min_width = 50
+        self.auto_width = True
+        self.max_allowed_width = 1000
+        
+        # Layout
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        # Left Handle
+        self.left_handle = TextResizeHandle(self, is_left=True)
+        self.layout.addWidget(self.left_handle)
+
+        # Text Edit
+        self.text_edit = InnerTextInputWidget(self)
+        self.layout.addWidget(self.text_edit)
+        
+        # Right Handle
+        self.right_handle = TextResizeHandle(self, is_left=False)
+        self.layout.addWidget(self.right_handle)
+        
+    def adjust_size(self):
+        if self.auto_width:
+            # Measure natural unwrapped width using a dummy document
+            doc = self.text_edit.document().clone()
+            doc.setTextWidth(-1)
+            natural_width = doc.idealWidth()
+            
+            if natural_width + 16 > self.max_allowed_width:
+                if self.text_edit.lineWrapMode() != QTextEdit.LineWrapMode.WidgetWidth:
+                    self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+                self.setFixedWidth(self.max_allowed_width)
+            else:
+                if self.text_edit.lineWrapMode() != QTextEdit.LineWrapMode.NoWrap:
+                    self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+                self.setFixedWidth(max(self.min_width, int(natural_width) + 16))
+        
+        # Let height automatically expand based on the text document height
+        doc_height = self.text_edit.document().size().height()
+        self.setFixedHeight(int(doc_height) + 10)
 
     def commit(self):
         if not self._committed:
             self._committed = True
-            self.editing_done.emit(self.toPlainText(), self)
+            self.editing_done.emit(self.text_edit.toPlainText(), self)
+            
+    def setFont(self, font):
+        self.text_edit.setFont(font)
+        
+    def setPlainText(self, text):
+        self.text_edit.setPlainText(text)
+        
+    def setFocus(self):
+        self.text_edit.setFocus()
+        
+    def clearFocus(self):
+        self.text_edit.clearFocus()
 
 class PDFPageItem(QGraphicsRectItem):
     """A visual representation of a single PDF page inside the QGraphicsScene."""
@@ -527,13 +624,14 @@ class PDFViewer(QGraphicsView):
             page_width, page_height = self.pdf_doc.get_page_size(page_item.page_num)
             margin = 10.0
             
-            # Start exactly at the click point, with a width of at least 100 points
+            # Start exactly at the click point
             start_x = pdf_point.x
-            max_width = min(400.0, max(100.0, page_width - start_x - margin))
+            max_width_pdf = max(50.0, page_width - start_x - margin)
+            max_width_px = int(max_width_pdf * self.zoom)
             
             # Convert adjusted coordinates back to scene and viewport coordinates
             adjusted_local_x = start_x * self.zoom
-            adjusted_local_y = local_pos.y()
+            adjusted_local_y = local_pos.y() - 8.0
             adjusted_scene_pos = QPointF(
                 page_item.pos().x() + adjusted_local_x,
                 page_item.pos().y() + adjusted_local_y
@@ -541,6 +639,7 @@ class PDFViewer(QGraphicsView):
             adjusted_viewport_pos = self.mapFromScene(adjusted_scene_pos)
             
             self.active_text_widget = TextInputWidget(self.viewport())
+            self.active_text_widget.max_allowed_width = max_width_px
             self.active_text_widget.scene_pos = adjusted_scene_pos
             self.active_text_widget.page_num = page_item.page_num
             self.active_text_widget.color_pdf = self.state.active_color_pdf
@@ -555,10 +654,10 @@ class PDFViewer(QGraphicsView):
             self.active_text_widget.setFont(font)
             
             r, g, b = self.state.active_color_rgb
-            self.active_text_widget.setStyleSheet(
-                f"background: transparent;"
+            self.active_text_widget.text_edit.setStyleSheet(
+                f"background: rgba(255, 255, 255, 0.4);"
                 f"color: rgb({r},{g},{b});"
-                f"border: none;"
+                f"border: 1px dashed #3b82f6;"
                 f"padding: 0px;"
                 f"margin: 0px;"
                 f"outline: none;"
@@ -567,12 +666,12 @@ class PDFViewer(QGraphicsView):
             # Use initial height based on font size and set geometry
             initial_height = int(screen_font_size * 1.5)
             self.active_text_widget.setGeometry(
-                adjusted_viewport_pos.x(), 
-                adjusted_viewport_pos.y(), 
-                int(max_width * self.zoom), 
+                int(adjusted_viewport_pos.x()) - 8, 
+                int(adjusted_viewport_pos.y()), 
+                100, 
                 initial_height
             )
-            self.active_text_widget.adjust_height_from_layout(self.active_text_widget.document().documentLayout().documentSize())
+            self.active_text_widget.text_edit.adjust_height_from_layout(self.active_text_widget.text_edit.document().documentLayout().documentSize())
             self.active_text_widget.show()
             self.active_text_widget.setFocus()
             
@@ -609,7 +708,22 @@ class PDFViewer(QGraphicsView):
                 self.drag_visual_item.setPos(x0, y0)
                 pen = QPen(QColor(59, 130, 246), 2, Qt.PenStyle.DashLine)
                 self.drag_visual_item.setPen(pen)
-                self.drag_visual_item.setBrush(QColor(59, 130, 246, 40))
+                
+                # If dragging a text annotation, display the actual text instead of just a box
+                if hasattr(self, 'dragged_annot_text') and self.dragged_annot_text:
+                    self.drag_visual_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                    self.drag_visual_item.setPen(QPen(Qt.PenStyle.NoPen))
+                    
+                    text_item = QGraphicsTextItem(self.dragged_annot_text, self.drag_visual_item)
+                    font = QFont("helvetica")
+                    font.setPixelSize(int(self.dragged_annot_fontsize * self.zoom))
+                    text_item.setFont(font)
+                    text_item.setTextWidth(w)
+                    text_item.setDefaultTextColor(QColor(*[int(c*255) for c in self.dragged_annot_color]))
+                    text_item.setPos(0, -4.0)
+                else:
+                    self.drag_visual_item.setBrush(QColor(59, 130, 246, 40))
+
                 self.drag_visual_item.setZValue(1000.0)
                 self._scene.addItem(self.drag_visual_item)
                 
@@ -891,10 +1005,10 @@ class PDFViewer(QGraphicsView):
                     r = int(self.dragged_annot_color[0] * 255)
                     g = int(self.dragged_annot_color[1] * 255)
                     b = int(self.dragged_annot_color[2] * 255)
-                    self.active_text_widget.setStyleSheet(
-                        f"background: transparent;"
+                    self.active_text_widget.text_edit.setStyleSheet(
+                        f"background: rgba(255, 255, 255, 0.4);"
                         f"color: rgb({r},{g},{b});"
-                        f"border: none;"
+                        f"border: 1px dashed #3b82f6;"
                         f"padding: 0px;"
                         f"margin: 0px;"
                         f"outline: none;"
@@ -902,15 +1016,19 @@ class PDFViewer(QGraphicsView):
                     
                     # Keep original annotation width exactly, with a minimum of 50 points
                     max_width = max(50.0, self.dragged_annot_rect.width)
+                    self.active_text_widget.auto_width = False
+                    self.active_text_widget.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+                    # The QFrame must be 18px wider than the text width to fit the handles (8px each) and border (2px)!
+                    widget_width = int(max_width * self.zoom) + 18
                     
                     # Set geometry and auto-adjust height
                     self.active_text_widget.setGeometry(
-                        viewport_pos.x(), 
-                        viewport_pos.y(), 
-                        int(max_width * self.zoom), 
+                        int(viewport_pos.x()) - 8, # Shift left by 8px so the inner text aligns perfectly with where the PDF text was!
+                        int(viewport_pos.y()), 
+                        widget_width, 
                         30
                     )
-                    self.active_text_widget.adjust_height_from_layout(self.active_text_widget.document().documentLayout().documentSize())
+                    self.active_text_widget.text_edit.adjust_height_from_layout(self.active_text_widget.text_edit.document().documentLayout().documentSize())
                     self.active_text_widget.show()
                     self.active_text_widget.setFocus()
                     
@@ -1157,18 +1275,8 @@ class PDFViewer(QGraphicsView):
             # User cleared text, since we deleted the annotation when editing started, it is already deleted.
             return
             
-        if hasattr(self, 'dragged_annot_text') and text == self.dragged_annot_text and widget.editing_annot_rect and widget.editing_annot_page >= 0:
-            # Restore original annotation exactly, with zero changes!
-            self.pdf_doc.add_text_annotation(
-                widget.editing_annot_page,
-                widget.editing_annot_rect,
-                self.dragged_annot_text,
-                widget.color_pdf,
-                fontsize=widget.font_size
-            )
-            page_item = self.page_items[widget.editing_annot_page]
-            page_item.reload_page()
-            return
+        # Removed short-circuit that restored the original rect if text was unchanged,
+        # so that manual width adjustments via handles are properly applied even if text didn't change!
             
         if widget.scene_pos:
             page_item, local_pos = self.get_page_under_pos(widget.scene_pos)
@@ -1176,18 +1284,19 @@ class PDFViewer(QGraphicsView):
                 pdf_point = self.get_pdf_point(local_pos)
                 
                 # Convert widget dimensions (pixels) back to PDF points
-                # Use document ideal width to get the actual text bounds, not the full widget width
-                doc_width = min(widget.width(), widget.document().idealWidth())
-                rect_width = (doc_width + 8) / self.zoom
+                # If auto_width is False, use the text_edit width (excluding handles) to perfectly match the allocated text space.
+                doc_width = widget.text_edit.document().idealWidth() + 16.0 if getattr(widget, 'auto_width', True) else widget.text_edit.width()
+                rect_width = doc_width / self.zoom
                 
-                # Height is the laid-out height plus a safety vertical buffer (15 PDF points)
-                rect_height = (widget.height() / self.zoom) + 15.0
+                # Height is the true text document height plus a minimal vertical buffer (2 PDF points)
+                # to prevent the invisible bounding box from extending far below the text
+                rect_height = (widget.text_edit.document().size().height() / self.zoom) + 2.0
                 
                 # Clamp coordinates to stay completely inside page boundaries (allowing a 10-point margin)
                 page_width, page_height = self.pdf_doc.get_page_size(page_item.page_num)
                 
                 start_x = pdf_point.x
-                start_y = pdf_point.y
+                start_y = pdf_point.y # Removed artificial offset, letting the Qt creation offset dictate the position
                 
                 if start_x + rect_width > page_width - 10.0:
                     start_x = max(10.0, page_width - rect_width - 10.0)

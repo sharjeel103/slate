@@ -6,7 +6,7 @@ set -e
 NAME="slate"
 MAINTAINER="Sharjeel Ahmed <sharjeelarain0308@gmail.com>"
 DESCRIPTION="A super lightweight, fast, and keyboard-driven PDF reader and annotator."
-VERSION="1.0"
+VERSION="1.0.0"
 
 # If an argument is provided, treat it as the version number
 if [[ "$#" -gt 0 ]]; then

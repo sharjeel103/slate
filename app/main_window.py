@@ -863,50 +863,68 @@ class MainWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         key = event.key()
+        mods = event.modifiers()
         
         # Block shortcuts if editing text or search bar is focused
         if self.viewer.active_text_widget or (self.viewer.search_bar and self.viewer.search_bar.input_field.hasFocus()):
             super().keyPressEvent(event)
             return
 
-        if key == Qt.Key.Key_Control:
+        ctrl_down = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift_down = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        # Temporary Eraser mode: Hold Ctrl + Shift simultaneously
+        if ctrl_down and shift_down:
             if not event.isAutoRepeat():
                 if self.pre_ctrl_tool is None:
                     self.pre_ctrl_tool = self.state.active_tool
                     self.set_tool(Tool.ERASER)
-            event.accept()
-            return
+            if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift):
+                event.accept()
+                return
 
-        if key == Qt.Key.Key_V:
-            self.set_tool(Tool.SELECT)
-        elif key == Qt.Key.Key_H:
-            self.set_tool(Tool.HIGHLIGHT)
-        elif key == Qt.Key.Key_P:
-            self.set_tool(Tool.PEN)
-        elif key == Qt.Key.Key_T:
-            self.set_tool(Tool.TEXT)
-        elif key == Qt.Key.Key_S:
-            self.set_tool(Tool.SQUARE)
-        elif key == Qt.Key.Key_A:
-            self.set_tool(Tool.ARROW)
-        elif key == Qt.Key.Key_E:
-            self.set_tool(Tool.ERASER)
-        elif key == Qt.Key.Key_R:
-            self.toggle_rect_select_mode()
-        elif key in (Qt.Key.Key_O, Qt.Key.Key_0, Qt.Key.Key_F9):
-            self.toggle_outline()
-        elif key == Qt.Key.Key_Slash:
-            self.viewer.show_search_bar()
+        # Single-letter tool shortcuts (only active when Ctrl is NOT pressed)
+        if not ctrl_down:
+            if key == Qt.Key.Key_V:
+                self.set_tool(Tool.SELECT)
+                return
+            elif key == Qt.Key.Key_H:
+                self.set_tool(Tool.HIGHLIGHT)
+                return
+            elif key == Qt.Key.Key_P:
+                self.set_tool(Tool.PEN)
+                return
+            elif key == Qt.Key.Key_T:
+                self.set_tool(Tool.TEXT)
+                return
+            elif key == Qt.Key.Key_S:
+                self.set_tool(Tool.SQUARE)
+                return
+            elif key == Qt.Key.Key_A:
+                self.set_tool(Tool.ARROW)
+                return
+            elif key == Qt.Key.Key_E:
+                self.set_tool(Tool.ERASER)
+                return
+            elif key == Qt.Key.Key_R:
+                self.toggle_rect_select_mode()
+                return
+            elif key in (Qt.Key.Key_O, Qt.Key.Key_0, Qt.Key.Key_F9):
+                self.toggle_outline()
+                return
+            elif key == Qt.Key.Key_Slash:
+                self.viewer.show_search_bar()
+                return
 
         # Vim-style scrolling (J down, K up, Shift+J next page, Shift+K prev page)
-        elif key == Qt.Key.Key_J:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        if key == Qt.Key.Key_J:
+            if mods & Qt.KeyboardModifier.ShiftModifier:
                 self.viewer.next_page()
             else:
                 bar = self.viewer.verticalScrollBar()
                 bar.setValue(bar.value() + bar.singleStep() * 3)
         elif key == Qt.Key.Key_K:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            if mods & Qt.KeyboardModifier.ShiftModifier:
                 self.viewer.prev_page()
             else:
                 bar = self.viewer.verticalScrollBar()
@@ -938,7 +956,7 @@ class MainWindow(QMainWindow):
             super().keyReleaseEvent(event)
             return
 
-        if event.key() == Qt.Key.Key_Control:
+        if event.key() in (Qt.Key.Key_Control, Qt.Key.Key_Shift):
             if not event.isAutoRepeat():
                 if hasattr(self, 'pre_ctrl_tool') and self.pre_ctrl_tool is not None:
                     self.set_tool(self.pre_ctrl_tool)
