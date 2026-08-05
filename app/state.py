@@ -8,6 +8,7 @@ class Tool(Enum):
     SQUARE = "Square"
     ARROW = "Arrow"
     ERASER = "Eraser"
+    CALLOUT = "Callout"
 
 # Define 5 lightened/pastel colors as RGB floats for PyMuPDF and ints for QColor
 # Arranged as requested: Yellow, Blue, Green, Red, Black
@@ -34,6 +35,7 @@ class AppState:
             Tool.TEXT: 5,      # Default: Black
             Tool.SQUARE: 4,    # Default: Red
             Tool.ARROW: 4,     # Default: Red
+            Tool.CALLOUT: 4,   # Default: Red
         }
         
     @property

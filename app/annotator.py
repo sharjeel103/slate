@@ -108,6 +108,7 @@ class PDFDocument:
         annot.set_colors(stroke=color_rgb)
         annot.set_border(width=width)
         annot.update()
+        return annot.rect
 
     def add_arrow_annotation(self, page_num, p1, p2, color_rgb, width=2):
         """
@@ -165,6 +166,7 @@ class PDFDocument:
         annot.set_colors(stroke=color_rgb)
         annot.set_border(width=width)
         annot.update()
+        return annot.rect
 
 
     def get_freetext_fontsize(self, annot):

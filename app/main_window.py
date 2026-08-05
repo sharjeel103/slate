@@ -315,6 +315,10 @@ class MainWindow(QMainWindow):
         else:
             self.splitter.setSizes([0, 1100])
             
+        # Force toolbar visibility so it cannot get permanently hidden
+        if hasattr(self, 'main_toolbar'):
+            self.main_toolbar.setVisible(True)
+            
         # Sync toggle button checked state with the restored splitter
         if hasattr(self, 'btn_outline'):
             sizes = self.splitter.sizes()
@@ -366,11 +370,17 @@ class MainWindow(QMainWindow):
         search_action.triggered.connect(self.viewer.show_search_bar)
         self.addAction(search_action)
 
+    def createPopupMenu(self):
+        # Disable the default toolbar/dock context menu entirely
+        return None
+
     def create_toolbars(self):
         toolbar = QToolBar("Tools", self)
         toolbar.setObjectName("Tools")
         toolbar.setMovable(False)
         toolbar.setOrientation(Qt.Orientation.Vertical)
+        toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        self.main_toolbar = toolbar
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, toolbar)
         
         # Open and Save Buttons (Visual)
@@ -404,6 +414,7 @@ class MainWindow(QMainWindow):
             Tool.TEXT: "T",
             Tool.SQUARE: "□",
             Tool.ARROW: "➔",
+            Tool.CALLOUT: "💬",
             Tool.ERASER: "🧽"
         }
         for tool in Tool:
@@ -523,6 +534,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.page_spin)
 
     def set_tool(self, tool):
+        if hasattr(self.viewer, 'cancel_callout'):
+            self.viewer.cancel_callout()
         self.state.active_tool = tool
         self.update_active_ui_indicators()
         self.show_status_message(f"Selected Tool: {tool.value}")
@@ -905,6 +918,9 @@ class MainWindow(QMainWindow):
                 return
             elif key == Qt.Key.Key_E:
                 self.set_tool(Tool.ERASER)
+                return
+            elif key == Qt.Key.Key_C:
+                self.set_tool(Tool.CALLOUT)
                 return
             elif key == Qt.Key.Key_R:
                 self.toggle_rect_select_mode()

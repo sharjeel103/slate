@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem, QGraphicsLineItem, QFrame, QHBoxLayout, QWidget, QGraphicsTextItem
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QTextEdit, QGraphicsRectItem, QGraphicsPathItem, QGraphicsLineItem, QFrame, QHBoxLayout, QWidget, QGraphicsTextItem, QApplication
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QBrush, QFont, QDesktopServices
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QRectF, QPointF, QLineF, QUrl, QThread, QTimer
 import fitz
@@ -58,6 +58,7 @@ class TextResizeHandle(QWidget):
             self.drag_start_x = event.globalPosition().x()
             self.start_geometry = self.parent_container.geometry()
             self.parent_container.auto_width = False
+            self.parent_container.resized_manually = True
             self.parent_container.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
             event.accept()
 
@@ -107,7 +108,7 @@ class InnerTextInputWidget(QTextEdit):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self.parent_container.commit()
+            self.parent_container.cancel()
         else:
             super().keyPressEvent(event)
 
@@ -129,6 +130,7 @@ class TextInputWidget(QFrame):
         self.font_size = 12
         self.min_width = 50
         self.auto_width = True
+        self.resized_manually = False
         self.max_allowed_width = 1000
         
         # Layout
@@ -169,9 +171,16 @@ class TextInputWidget(QFrame):
         self.setFixedHeight(int(doc_height) + 10)
 
     def commit(self):
-        if not self._committed:
-            self._committed = True
-            self.editing_done.emit(self.text_edit.toPlainText(), self)
+        if self._committed:
+            return
+        self._committed = True
+        self.editing_done.emit(self.text_edit.toPlainText(), self)
+
+    def cancel(self):
+        if self._committed:
+            return
+        self._committed = True
+        self.editing_done.emit(None, self)
             
     def setFont(self, font):
         self.text_edit.setFont(font)
@@ -309,6 +318,12 @@ class PDFViewer(QGraphicsView):
         self.last_click_time = 0.0
         self.click_sequence_count = 0
         
+        # Callout Tool state
+        self.callout_phase = 0
+        self.callout_box_rect = None
+        self.callout_arrow_start = None
+        self.temp_arrow_item = None
+
         # In-place Text widget
         self.active_text_widget = None
 
@@ -561,7 +576,20 @@ class PDFViewer(QGraphicsView):
             
         elif tool in (Tool.HIGHLIGHT, Tool.SELECT):
             self.drawing = True
-            self.clear_selection_graphics()
+            
+            modifiers = QApplication.keyboardModifiers()
+            self.is_ctrl_pressed = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+            
+            if not self.is_ctrl_pressed:
+                self.clear_selection_graphics()
+                self.accumulated_selected_indices = set()
+            else:
+                if not hasattr(self, 'selected_word_indices'):
+                    self.selected_word_indices = set()
+                elif isinstance(self.selected_word_indices, list):
+                    self.selected_word_indices = set(self.selected_word_indices)
+                self.accumulated_selected_indices = set(self.selected_word_indices)
+                self.clear_selected_word_graphics()
             
             # Manual double/triple click detection using time differences
             now = time.time()
@@ -578,6 +606,13 @@ class PDFViewer(QGraphicsView):
                 self.drawing = False  # Disable drag expansion
                 self.selection_start_word_idx = target_idx
                 self.selection_end_word_idx = target_idx
+                
+                current_drag = {target_idx}
+                if getattr(self, 'is_ctrl_pressed', False):
+                    self.selected_word_indices = self.accumulated_selected_indices ^ current_drag
+                else:
+                    self.selected_word_indices = current_drag
+                    
                 self.update_selection_overlays()
                 
                 if tool == Tool.SELECT:
@@ -596,6 +631,13 @@ class PDFViewer(QGraphicsView):
                 if block_indices:
                     self.selection_start_word_idx = min(block_indices)
                     self.selection_end_word_idx = max(block_indices)
+                    
+                    current_drag = set(range(min(block_indices), max(block_indices) + 1))
+                    if getattr(self, 'is_ctrl_pressed', False):
+                        self.selected_word_indices = self.accumulated_selected_indices ^ current_drag
+                    else:
+                        self.selected_word_indices = current_drag
+                        
                     self.update_selection_overlays()
                     
                     if tool == Tool.SELECT:
@@ -610,7 +652,7 @@ class PDFViewer(QGraphicsView):
                 if target_idx != -1:
                     self.selected_word_indices = [target_idx]
                 else:
-                    self.selected_word_indices = []
+                    self.selected_word_indices = set()
                 self.update_selection_overlays()
             
         elif tool == Tool.TEXT:
@@ -683,6 +725,95 @@ class PDFViewer(QGraphicsView):
             self.drawing = True
             self.drag_start_local_pos = local_pos
             self.drag_start_scene_pos = scene_pos
+            
+        elif tool == Tool.CALLOUT:
+            if getattr(self, 'callout_phase', 0) == 0:
+                self.drawing = True
+                self.active_page_num = page_item.page_num
+                self.drag_start_local_pos = local_pos
+                self.drag_start_scene_pos = scene_pos
+            elif getattr(self, 'callout_phase', 0) == 1:
+                # Step 2 click: Arrow is finished
+                p2_pdf = self.get_pdf_point(local_pos)
+                
+                actual_rect = self.pdf_doc.add_arrow_annotation(
+                    self.active_page_num,
+                    self.callout_arrow_start,
+                    p2_pdf,
+                    self.state.active_color_pdf,
+                    width=self.state.active_line_width
+                )
+                self.callout_arrow_rect = actual_rect
+                self.page_items[self.active_page_num].reload_page()
+                self.document_modified.emit()
+                
+                if hasattr(self, 'temp_arrow_item') and self.temp_arrow_item:
+                    try:
+                        self._scene.removeItem(self.temp_arrow_item)
+                    except Exception:
+                        pass
+                    self.temp_arrow_item = None
+                self.setMouseTracking(False)
+                
+                # Start Text phase!
+                self.callout_phase = 2
+                
+                # Inline spawn text input at p2_pdf!
+                if self.active_text_widget:
+                    self.active_text_widget.clearFocus()
+                    
+                viewport_pos = event.pos()
+                
+                pdf_point = p2_pdf
+                page_width, page_height = self.pdf_doc.get_page_size(page_item.page_num)
+                margin = 10.0
+                
+                start_x = pdf_point.x
+                max_width_pdf = max(50.0, page_width - start_x - margin)
+                max_width_px = int(max_width_pdf * self.zoom)
+                
+                adjusted_local_x = start_x * self.zoom
+                adjusted_local_y = local_pos.y() - 8.0
+                adjusted_scene_pos = QPointF(
+                    page_item.pos().x() + adjusted_local_x,
+                    page_item.pos().y() + adjusted_local_y
+                )
+                adjusted_viewport_pos = self.mapFromScene(adjusted_scene_pos)
+                
+                self.active_text_widget = TextInputWidget(self.viewport())
+                self.active_text_widget.max_allowed_width = max_width_px
+                self.active_text_widget.scene_pos = adjusted_scene_pos
+                self.active_text_widget.page_num = page_item.page_num
+                self.active_text_widget.color_pdf = self.state.active_color_pdf
+                self.active_text_widget.font_size = self.state.active_font_size
+                
+                self.active_text_widget.editing_done.connect(self.finish_text_input)
+                
+                screen_font_size = self.state.active_font_size * self.zoom
+                font = QFont("helvetica")
+                font.setPixelSize(int(screen_font_size))
+                self.active_text_widget.setFont(font)
+                
+                r, g, b = self.state.active_color_rgb
+                self.active_text_widget.text_edit.setStyleSheet(
+                    f"background: rgba(255, 255, 255, 0.4);"
+                    f"color: rgb({r},{g},{b});"
+                    f"border: 1px dashed #3b82f6;"
+                    f"padding: 0px;"
+                    f"margin: 0px;"
+                    f"outline: none;"
+                )
+                
+                initial_height = int(screen_font_size * 1.5)
+                self.active_text_widget.setGeometry(
+                    int(adjusted_viewport_pos.x()) - 8, 
+                    int(adjusted_viewport_pos.y()), 
+                    100, 
+                    initial_height
+                )
+                self.active_text_widget.text_edit.adjust_height_from_layout(self.active_text_widget.text_edit.document().documentLayout().documentSize())
+                self.active_text_widget.show()
+                self.active_text_widget.setFocus()
 
     def mouseMoveEvent(self, event):
         if not self.pdf_doc or not self.page_items:
@@ -736,7 +867,8 @@ class PDFViewer(QGraphicsView):
             event.accept()
             return
 
-        if not self.drawing or self.active_page_num == -1:
+        is_callout_preview = (self.state.active_tool == Tool.CALLOUT and getattr(self, 'callout_phase', 0) == 1)
+        if (not getattr(self, 'drawing', False) and not is_callout_preview) or self.active_page_num == -1:
             self.update_cursor_for_position(scene_pos)
             super().mouseMoveEvent(event)
             return
@@ -788,11 +920,16 @@ class PDFViewer(QGraphicsView):
                 drag_rect = fitz.Rect(x0_pdf, y0_pdf, x1_pdf, y1_pdf)
                 
                 words = self.pdf_doc.get_words(self.active_page_num)
-                self.selected_word_indices = []
+                current_drag = set()
                 for idx, w in enumerate(words):
                     word_rect = fitz.Rect(w[0], w[1], w[2], w[3])
                     if word_rect.intersects(drag_rect):
-                        self.selected_word_indices.append(idx)
+                        current_drag.add(idx)
+                        
+                if getattr(self, 'is_ctrl_pressed', False):
+                    self.selected_word_indices = getattr(self, 'accumulated_selected_indices', set()) ^ current_drag
+                else:
+                    self.selected_word_indices = current_drag
                 self.update_selection_overlays()
             else:
                 # Reading-order selection
@@ -801,13 +938,67 @@ class PDFViewer(QGraphicsView):
                     self.selection_end_word_idx = idx
                     start = min(self.selection_start_word_idx, self.selection_end_word_idx)
                     end = max(self.selection_start_word_idx, self.selection_end_word_idx)
-                    self.selected_word_indices = list(range(start, end + 1))
+                    
+                    current_drag = set(range(start, end + 1))
+                    if getattr(self, 'is_ctrl_pressed', False):
+                        self.selected_word_indices = getattr(self, 'accumulated_selected_indices', set()) ^ current_drag
+                    else:
+                        self.selected_word_indices = current_drag
+                        
                     self.update_selection_overlays()
                     
         elif tool == Tool.ERASER:
             self.erase_at(self.active_page_num, local_pos)
             
-        elif tool == Tool.SQUARE:
+        elif tool in (Tool.SQUARE, Tool.CALLOUT):
+            if tool == Tool.CALLOUT and getattr(self, 'callout_phase', 0) == 1:
+                # Arrow live preview
+                if not hasattr(self, 'temp_arrow_item') or not self.temp_arrow_item:
+                    self.temp_arrow_item = QGraphicsPathItem()
+                    pen = QPen(QColor(*self.state.active_color_rgb), self.state.active_line_width * self.zoom, Qt.PenStyle.SolidLine)
+                    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                    self.temp_arrow_item.setPen(pen)
+                    self.temp_arrow_item.setZValue(1000.0)
+                    self._scene.addItem(self.temp_arrow_item)
+                
+                page_item = self.page_items[self.active_page_num] if 0 <= self.active_page_num < len(self.page_items) else None
+                if page_item:
+                    p1 = page_item.pos() + QPointF(self.callout_arrow_start.x * self.zoom, self.callout_arrow_start.y * self.zoom)
+                    p2 = scene_pos
+                    dx = p2.x() - p1.x()
+                    dy = p2.y() - p1.y()
+                    length = (dx**2 + dy**2)**0.5
+                    
+                    path = QPainterPath()
+                    if length > 0:
+                        ux = dx / length
+                        uy = dy / length
+                        width = self.state.active_line_width * self.zoom
+                        base_size = 6.0 * self.zoom + 1.5 * width
+                        base_size = min(base_size, 18.0 * self.zoom)
+                        arrow_size = min(base_size, length * 0.3)
+                        if length > 10 * self.zoom:
+                            arrow_size = max(arrow_size, 5.0 * self.zoom)
+                        c = 0.866025
+                        s = 0.5
+                        vx = -ux * c - uy * s
+                        vy = ux * s - uy * c
+                        wx = -ux * c + uy * s
+                        wy = -ux * s - uy * c
+                        left_x = p2.x() + arrow_size * vx
+                        left_y = p2.y() + arrow_size * vy
+                        right_x = p2.x() + arrow_size * wx
+                        right_y = p2.y() + arrow_size * wy
+                        path.moveTo(p1)
+                        path.lineTo(p2)
+                        path.lineTo(QPointF(left_x, left_y))
+                        path.moveTo(p2)
+                        path.lineTo(QPointF(right_x, right_y))
+                    self.temp_arrow_item.setPath(path)
+                return
+            if not getattr(self, 'drawing', False):
+                return
             # Draw a temporary rectangle outline in scene coordinates
             x0 = min(self.drag_start_scene_pos.x(), scene_pos.x())
             y0 = min(self.drag_start_scene_pos.y(), scene_pos.y())
@@ -1018,8 +1209,8 @@ class PDFViewer(QGraphicsView):
                     max_width = max(50.0, self.dragged_annot_rect.width)
                     self.active_text_widget.auto_width = False
                     self.active_text_widget.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-                    # The QFrame must be 18px wider than the text width to fit the handles (8px each) and border (2px)!
-                    widget_width = int(max_width * self.zoom) + 18
+                    # The QFrame must be 24px wider than the text width to fit the handles (8px each) + border + safe padding!
+                    widget_width = int(max_width * self.zoom) + 24
                     
                     # Set geometry and auto-adjust height
                     self.active_text_widget.setGeometry(
@@ -1059,7 +1250,10 @@ class PDFViewer(QGraphicsView):
                 self.page_items[self.active_page_num].reload_page()
                 self.document_modified.emit()
                 
-        elif tool in (Tool.SQUARE, Tool.ARROW):
+        elif tool in (Tool.SQUARE, Tool.ARROW, Tool.CALLOUT):
+            if tool == Tool.CALLOUT and getattr(self, 'callout_phase', 0) != 0:
+                return # Arrow click is handled in mousePressEvent for Phase 1!
+                
             if hasattr(self, 'temp_shape_item') and self.temp_shape_item is not None:
                 try:
                     self._scene.removeItem(self.temp_shape_item)
@@ -1074,14 +1268,14 @@ class PDFViewer(QGraphicsView):
                 p1_pdf = self.get_pdf_point(self.drag_start_local_pos)
                 p2_pdf = self.get_pdf_point(local_pos)
                 
-                if tool == Tool.SQUARE:
+                if tool in (Tool.SQUARE, Tool.CALLOUT):
                     x0 = min(p1_pdf.x, p2_pdf.x)
                     y0 = min(p1_pdf.y, p2_pdf.y)
                     x1 = max(p1_pdf.x, p2_pdf.x)
                     y1 = max(p1_pdf.y, p2_pdf.y)
                     pdf_rect = fitz.Rect(x0, y0, x1, y1)
                     if pdf_rect.width > 2 and pdf_rect.height > 2:
-                        self.pdf_doc.add_square_annotation(
+                        actual_rect = self.pdf_doc.add_square_annotation(
                             self.active_page_num,
                             pdf_rect,
                             self.state.active_color_pdf,
@@ -1090,6 +1284,20 @@ class PDFViewer(QGraphicsView):
                         self.page_items[self.active_page_num].reload_page()
                         self.document_modified.emit()
                         
+                        if tool == Tool.CALLOUT:
+                            self.callout_box_rect = actual_rect
+                            corners = [
+                                fitz.Point(pdf_rect.x0, pdf_rect.y0),
+                                fitz.Point(pdf_rect.x1, pdf_rect.y0),
+                                fitz.Point(pdf_rect.x0, pdf_rect.y1),
+                                fitz.Point(pdf_rect.x1, pdf_rect.y1)
+                            ]
+                            # Use p2_pdf which is where the drag ended!
+                            self.callout_arrow_start = min(corners, key=lambda p: (p.x - p2_pdf.x)**2 + (p.y - p2_pdf.y)**2)
+                            self.callout_phase = 1
+                            self.setMouseTracking(True)
+                            return # Do not set active_page_num to -1
+                            
                 elif tool == Tool.ARROW:
                     dist = ((p1_pdf.x - p2_pdf.x)**2 + (p1_pdf.y - p2_pdf.y)**2)**0.5
                     if dist > 2:
@@ -1125,32 +1333,21 @@ class PDFViewer(QGraphicsView):
         if not words:
             return -1
             
-        # Contain check
+        # Contain check with a tiny 2-point padding to make hitting words easier
         for idx, w in enumerate(words):
-            rect = fitz.Rect(w[0], w[1], w[2], w[3])
+            rect = fitz.Rect(w[0] - 2, w[1] - 2, w[2] + 2, w[3] + 2)
             if rect.contains(pdf_point):
                 return idx
                 
-        # Proximity distance check
-        min_dist = float('inf')
-        closest_idx = -1
-        for idx, w in enumerate(words):
-            cx = (w[0] + w[2]) / 2.0
-            cy = (w[1] + w[3]) / 2.0
-            dist = (pdf_point.x - cx)**2 + (pdf_point.y - cy)**2
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = idx
-        return closest_idx
+        # No proximity fallback; the mouse must be on the word.
+        return -1
 
     def update_selection_overlays(self):
         self.clear_selected_word_graphics()
-        if self.active_page_num == -1 or self.selection_start_word_idx == -1 or self.selection_end_word_idx == -1:
+        if self.active_page_num == -1 or not getattr(self, 'selected_word_indices', set()):
             return
             
         words = self.pdf_doc.get_words(self.active_page_num)
-        start = min(self.selection_start_word_idx, self.selection_end_word_idx)
-        end = max(self.selection_start_word_idx, self.selection_end_word_idx)
         
         tool = self.state.active_tool
         if tool == Tool.HIGHLIGHT:
@@ -1231,27 +1428,84 @@ class PDFViewer(QGraphicsView):
 
     def copy_selection_to_clipboard(self):
         """Processes the selected text range, saving it in memory but NOT auto-copying to clipboard."""
-        if self.active_page_num == -1 or not hasattr(self, 'selected_word_indices') or not self.selected_word_indices:
+        if self.active_page_num == -1 or not getattr(self, 'selected_word_indices', set()):
             self.clear_selection_graphics()
             return
             
         words = self.pdf_doc.get_words(self.active_page_num)
-        sorted_indices = sorted(self.selected_word_indices)
+        sorted_indices = sorted(list(self.selected_word_indices))
         
         selected_words = [words[idx] for idx in sorted_indices if 0 <= idx < len(words)]
-        self.selected_text_content = " ".join([w[4] for w in selected_words])
+        if not selected_words:
+            self.selected_text_content = ""
+            return
+            
+        selected_blocks = set(w[5] for w in selected_words)
+        min_x = min(w[0] for w in words if w[5] in selected_blocks)
+        
+        text_parts = []
+        last_block = -1
+        last_line = -1
+        last_word_no = -1
+        
+        for w in selected_words:
+            block_no = w[5]
+            line_no = w[6]
+            word_no = w[7]
+            word_str = w[4]
+            
+            if last_block != -1:
+                if block_no != last_block or line_no != last_line:
+                    if block_no != last_block:
+                        text_parts.append("\n\n")
+                    else:
+                        text_parts.append("\n")
+                    # Calculate and insert visual indentation
+                    char_width = (w[2] - w[0]) / max(len(w[4]), 1)
+                    indent = max(0.0, w[0] - min_x)
+                    num_spaces = int(round(indent / char_width)) if char_width > 0 else 0
+                    text_parts.append(" " * num_spaces)
+                elif word_no != last_word_no + 1:
+                    text_parts.append(" ... ") # Indication of skipped words
+                else:
+                    text_parts.append(" ")
+            else:
+                # Initial indentation for the very first line if they didn't select from the leftmost edge
+                char_width = (w[2] - w[0]) / max(len(w[4]), 1)
+                indent = max(0.0, w[0] - min_x)
+                num_spaces = int(round(indent / char_width)) if char_width > 0 else 0
+                text_parts.append(" " * num_spaces)
+            
+            text_parts.append(word_str)
+            last_block = block_no
+            last_line = line_no
+            last_word_no = word_no
+            
+        self.selected_text_content = "".join(text_parts)
         
         if self.selected_text_content:
-            self.status_message.emit(f"Selected text (Press Ctrl+C to copy): \"{self.selected_text_content[:40]}...\"")
+            status_preview = self.selected_text_content.replace("\n", " ")[:40]
+            self.status_message.emit(f"Selected text (Press Ctrl+C to copy): \"{status_preview}...\"")
 
     def get_selected_text(self):
         """Returns the currently selected text contents."""
         return self.selected_text_content
 
     def finish_text_input(self, text, widget):
+        if text is None or not text.strip():
+            # If empty or explicitly cancelled via Escape, don't create annot.
+            if getattr(self, 'callout_phase', 0) > 0:
+                self.cancel_callout()
+            if self.active_text_widget:
+                self.active_text_widget.deleteLater()
+                self.active_text_widget = None
+            return
+
         if self.active_text_widget == widget:
             self.active_text_widget = None
             
+        was_callout = getattr(self, 'callout_phase', 0) == 2
+        
         widget.deleteLater()
         
         if not self.pdf_doc:
@@ -1271,10 +1525,6 @@ class PDFViewer(QGraphicsView):
                 page_item.reload_page()
             return
             
-        if text == "":
-            # User cleared text, since we deleted the annotation when editing started, it is already deleted.
-            return
-            
         # Removed short-circuit that restored the original rect if text was unchanged,
         # so that manual width adjustments via handles are properly applied even if text didn't change!
             
@@ -1284,9 +1534,11 @@ class PDFViewer(QGraphicsView):
                 pdf_point = self.get_pdf_point(local_pos)
                 
                 # Convert widget dimensions (pixels) back to PDF points
-                # If auto_width is False, use the text_edit width (excluding handles) to perfectly match the allocated text space.
-                doc_width = widget.text_edit.document().idealWidth() + 16.0 if getattr(widget, 'auto_width', True) else widget.text_edit.width()
-                rect_width = doc_width / self.zoom
+                if not getattr(widget, 'auto_width', True) and not getattr(widget, 'resized_manually', False) and getattr(widget, 'editing_annot_rect', None):
+                    rect_width = widget.editing_annot_rect.width
+                else:
+                    doc_width = widget.text_edit.document().idealWidth() + 4.0 if getattr(widget, 'auto_width', True) else widget.text_edit.width()
+                    rect_width = doc_width / self.zoom
                 
                 # Height is the true text document height plus a minimal vertical buffer (2 PDF points)
                 # to prevent the invisible bounding box from extending far below the text
@@ -1319,6 +1571,13 @@ class PDFViewer(QGraphicsView):
                 )
                 page_item.reload_page()
                 self.document_modified.emit()
+                
+            if was_callout:
+                self.callout_phase = 0
+                self.callout_box_rect = None
+                self.callout_arrow_rect = None
+                self.callout_arrow_start = None
+                self.active_page_num = -1
 
     def clear_selected_word_graphics(self):
         for item in self.selected_word_items:
@@ -1331,7 +1590,7 @@ class PDFViewer(QGraphicsView):
     def clear_selection_graphics(self):
         self.selection_start_word_idx = -1
         self.selection_end_word_idx = -1
-        self.selected_word_indices = []
+        self.selected_word_indices = set()
         self.clear_selected_word_graphics()
         self.selected_text_content = ""
         self.cleanup_temp_rect()
@@ -1393,8 +1652,49 @@ class PDFViewer(QGraphicsView):
         local_pos = self.viewport().mapFromGlobal(QCursor.pos())
         self.update_cursor_for_position(self.mapToScene(local_pos))
 
+    def cancel_callout(self):
+        if self.callout_phase > 0:
+            if self.temp_arrow_item:
+                try:
+                    self._scene.removeItem(self.temp_arrow_item)
+                except Exception:
+                    pass
+                self.temp_arrow_item = None
+            
+            if self.active_page_num != -1:
+                changed = False
+                if getattr(self, 'callout_box_rect', None):
+                    if self.pdf_doc.delete_annotation_by_rect(self.active_page_num, self.callout_box_rect):
+                        changed = True
+                
+                if getattr(self, 'callout_arrow_rect', None):
+                    if self.pdf_doc.delete_annotation_by_rect(self.active_page_num, self.callout_arrow_rect):
+                        changed = True
+                        
+                if changed:
+                    self.page_items[self.active_page_num].reload_page()
+                    self.document_modified.emit()
+            
+            if self.active_text_widget and self.callout_phase == 2:
+                self.active_text_widget.deleteLater()
+                self.active_text_widget = None
+                
+            self.callout_phase = 0
+            self.callout_box_rect = None
+            self.callout_arrow_rect = None
+            self.callout_arrow_start = None
+            self.active_page_num = -1
+            self.setMouseTracking(False)
+            
     def keyPressEvent(self, event):
-        super().keyPressEvent(event)
+        if event.key() == Qt.Key.Key_Escape:
+            if self.callout_phase > 0:
+                self.cancel_callout()
+            if self.active_text_widget:
+                self.active_text_widget.deleteLater()
+                self.active_text_widget = None
+        else:
+            super().keyPressEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
