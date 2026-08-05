@@ -726,6 +726,57 @@ class PDFViewer(QGraphicsView):
             self.drag_start_local_pos = local_pos
             self.drag_start_scene_pos = scene_pos
             
+        elif tool == Tool.LINE:
+            if getattr(self, 'line_phase', 0) == 0:
+                self.drawing = True
+                self.active_page_num = page_item.page_num
+                self.line_start_local_pos = local_pos
+                self.line_start_scene_pos = scene_pos
+                self.line_phase = 1
+                
+                # Create temp visual line
+                pen = QPen(QColor(*self.state.active_color_rgb), self.state.active_line_width * self.zoom)
+                self.temp_line_item = self._scene.addLine(QLineF(scene_pos, scene_pos), pen)
+                self.temp_line_item.setZValue(1000.0)
+                self.setMouseTracking(True)
+                
+            elif getattr(self, 'line_phase', 0) == 1:
+                end_local = local_pos
+                end_scene = scene_pos
+                modifiers = QApplication.keyboardModifiers()
+                self.is_ctrl_pressed = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+                
+                if self.is_ctrl_pressed:
+                    dx = end_local.x() - self.line_start_local_pos.x()
+                    dy = end_local.y() - self.line_start_local_pos.y()
+                    if abs(dx) > abs(dy):
+                        end_local.setY(self.line_start_local_pos.y())
+                        end_scene.setY(self.line_start_scene_pos.y())
+                    else:
+                        end_local.setX(self.line_start_local_pos.x())
+                        end_scene.setX(self.line_start_scene_pos.x())
+                
+                p1_pdf = self.get_pdf_point(self.line_start_local_pos)
+                p2_pdf = self.get_pdf_point(end_local)
+                
+                if p1_pdf.x != p2_pdf.x or p1_pdf.y != p2_pdf.y:
+                    self.pdf_doc.add_line_annotation(
+                        self.active_page_num,
+                        p1_pdf,
+                        p2_pdf,
+                        self.state.active_color_pdf,
+                        self.state.active_line_width
+                    )
+                    self.page_items[self.active_page_num].reload_page()
+                    self.document_modified.emit()
+                
+                # Current end point becomes the NEW start point for continuous drawing
+                self.line_start_local_pos = end_local
+                self.line_start_scene_pos = end_scene
+                
+                if hasattr(self, 'temp_line_item') and self.temp_line_item:
+                    self.temp_line_item.setLine(QLineF(end_scene, end_scene))
+
         elif tool == Tool.CALLOUT:
             if getattr(self, 'callout_phase', 0) == 0:
                 self.drawing = True
@@ -868,7 +919,8 @@ class PDFViewer(QGraphicsView):
             return
 
         is_callout_preview = (self.state.active_tool == Tool.CALLOUT and getattr(self, 'callout_phase', 0) == 1)
-        if (not getattr(self, 'drawing', False) and not is_callout_preview) or self.active_page_num == -1:
+        is_line_preview = (self.state.active_tool == Tool.LINE and getattr(self, 'line_phase', 0) == 1)
+        if (not getattr(self, 'drawing', False) and not is_callout_preview and not is_line_preview) or self.active_page_num == -1:
             self.update_cursor_for_position(scene_pos)
             super().mouseMoveEvent(event)
             return
@@ -879,7 +931,22 @@ class PDFViewer(QGraphicsView):
         
         tool = self.state.active_tool
         
-        if tool == Tool.PEN and self.temp_path_item and self.active_path:
+        modifiers = QApplication.keyboardModifiers()
+        self.is_ctrl_pressed = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        
+        if tool == Tool.LINE and getattr(self, 'line_phase', 0) == 1:
+            end_scene = QPointF(scene_pos)
+            if self.is_ctrl_pressed:
+                dx = scene_pos.x() - self.line_start_scene_pos.x()
+                dy = scene_pos.y() - self.line_start_scene_pos.y()
+                if abs(dx) > abs(dy):
+                    end_scene.setY(self.line_start_scene_pos.y())
+                else:
+                    end_scene.setX(self.line_start_scene_pos.x())
+            if hasattr(self, 'temp_line_item') and self.temp_line_item:
+                self.temp_line_item.setLine(QLineF(self.line_start_scene_pos, end_scene))
+                
+        elif tool == Tool.PEN and self.temp_path_item and self.active_path:
             pdf_point = self.get_pdf_point(local_pos)
             self.current_stroke_points.append(pdf_point)
             self.active_path.lineTo(scene_pos)
@@ -1250,9 +1317,11 @@ class PDFViewer(QGraphicsView):
                 self.page_items[self.active_page_num].reload_page()
                 self.document_modified.emit()
                 
-        elif tool in (Tool.SQUARE, Tool.ARROW, Tool.CALLOUT):
+        elif tool in (Tool.SQUARE, Tool.ARROW, Tool.CALLOUT, Tool.LINE):
             if tool == Tool.CALLOUT and getattr(self, 'callout_phase', 0) != 0:
                 return # Arrow click is handled in mousePressEvent for Phase 1!
+            if tool == Tool.LINE and getattr(self, 'line_phase', 0) != 0:
+                return # Line click is handled in mousePressEvent for Phase 1!
                 
             if hasattr(self, 'temp_shape_item') and self.temp_shape_item is not None:
                 try:
@@ -1640,8 +1709,8 @@ class PDFViewer(QGraphicsView):
                 self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         elif tool == Tool.TEXT:
             self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-        elif tool == Tool.PEN:
-            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        elif tool in (Tool.PEN, Tool.LINE):
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         elif tool == Tool.ERASER:
             self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         else:
@@ -1685,11 +1754,25 @@ class PDFViewer(QGraphicsView):
             self.callout_arrow_start = None
             self.active_page_num = -1
             self.setMouseTracking(False)
+
+    def cancel_line(self):
+        if getattr(self, 'line_phase', 0) > 0:
+            if hasattr(self, 'temp_line_item') and self.temp_line_item:
+                try:
+                    self._scene.removeItem(self.temp_line_item)
+                except Exception:
+                    pass
+                self.temp_line_item = None
+            self.line_phase = 0
+            self.drawing = False
+            self.setMouseTracking(False)
             
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             if self.callout_phase > 0:
                 self.cancel_callout()
+            if getattr(self, 'line_phase', 0) > 0:
+                self.cancel_line()
             if self.active_text_widget:
                 self.active_text_widget.deleteLater()
                 self.active_text_widget = None

@@ -1,6 +1,6 @@
-from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar, QFileDialog, QLabel, QScrollArea, QStatusBar, QPushButton, QButtonGroup, QSizePolicy, QSpinBox, QSplitter, QTreeWidget, QTreeWidgetItem, QLineEdit
-from PyQt6.QtGui import QAction, QKeySequence, QIcon, QColor, QFont
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar, QFileDialog, QLabel, QScrollArea, QStatusBar, QPushButton, QButtonGroup, QSizePolicy, QSpinBox, QSplitter, QTreeWidget, QTreeWidgetItem, QLineEdit, QMenu, QWidgetAction
+from PyQt6.QtGui import QAction, QKeySequence, QIcon, QColor, QFont, QShortcut
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QPoint
 import os
 
 class SearchLineEdit(QLineEdit):
@@ -274,9 +274,13 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar(self)
         self.setStatusBar(self.status_bar)
         
-        # Status label
+        # Status label (for ephemeral messages)
         self.status_label = QLabel("Welcome to PDF Annotator. Press Ctrl+O to open a PDF.", self)
         self.status_bar.addWidget(self.status_label)
+        
+        # Permanent Page label (always visible on the right)
+        self.page_label = QLabel("Page: -", self)
+        self.status_bar.addPermanentWidget(self.page_label)
         
         # Setup Toolbars & Shortcuts
         self.create_toolbars()
@@ -370,6 +374,76 @@ class MainWindow(QMainWindow):
         search_action.triggered.connect(self.viewer.show_search_bar)
         self.addAction(search_action)
 
+        # Bind Alt+Shift+[1-5] for toggling color shades
+        for idx in range(1, 6):
+            shortcut = QShortcut(QKeySequence(f"Alt+Shift+{idx}"), self)
+            shortcut.activated.connect(lambda i=idx: self.toggle_color_shade(i))
+
+        # Line tool shortcut
+        shortcut_line = QShortcut(QKeySequence("L"), self)
+        shortcut_line.activated.connect(lambda: self.set_tool(Tool.LINE))
+
+    def toggle_color_shade(self, color_idx):
+        self.state.active_color_index = color_idx
+        current_shade = self.state.active_shade_index
+        self.state.active_shade_index = (current_shade + 1) % 3
+        self.update_active_ui_indicators()
+
+    def show_color_shades_menu(self, pos, color_idx, button_widget):
+        menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #2b2b2b;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """)
+        
+        # Create a widget to hold the horizontal layout
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        
+        shades = COLORS[color_idx]["shades"]
+        for shade_idx, shade in enumerate(shades):
+            btn = QPushButton()
+            btn.setFixedSize(24, 24)
+            r, g, b = shade["rgb"]
+            
+            # Highlight the currently active shade for this color/tool
+            border = "2px solid white" if (self.state.active_color_index == color_idx and self.state.active_shade_index == shade_idx) else "1px solid #444"
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: rgb({r},{g},{b});
+                    border: {border};
+                    border-radius: 12px;
+                }}
+                QPushButton:hover {{
+                    border: 2px solid #aaa;
+                }}
+            """)
+            
+            # When a shade is clicked, set the color and shade, update UI, and close menu
+            def on_shade_clicked(checked=False, c_idx=color_idx, s_idx=shade_idx):
+                self.state.active_color_index = c_idx
+                self.state.active_shade_index = s_idx
+                self.update_active_ui_indicators()
+                menu.close()
+                
+            btn.clicked.connect(on_shade_clicked)
+            layout.addWidget(btn)
+            
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(widget)
+        menu.addAction(action)
+        
+        # Show menu at the bottom-left of the color button
+        global_pos = button_widget.mapToGlobal(QPoint(0, button_widget.height()))
+        menu.exec(global_pos)
+
     def createPopupMenu(self):
         # Disable the default toolbar/dock context menu entirely
         return None
@@ -409,19 +483,33 @@ class MainWindow(QMainWindow):
         self.tool_buttons = {}
         tool_symbols = {
             Tool.SELECT: "⬈",
-            Tool.HIGHLIGHT: "🖍️",
-            Tool.PEN: "✎",
+            Tool.HIGHLIGHT: "🟨",
+            Tool.PEN: "🖋️",
             Tool.TEXT: "T",
             Tool.SQUARE: "□",
             Tool.ARROW: "➔",
             Tool.CALLOUT: "💬",
-            Tool.ERASER: "🧽"
+            Tool.ERASER: "🧹",
+            Tool.LINE: "−"
         }
+        tool_shortcuts = {
+            Tool.SELECT: "V",
+            Tool.HIGHLIGHT: "H",
+            Tool.CALLOUT: "C",
+            Tool.PEN: "P",
+            Tool.TEXT: "T",
+            Tool.SQUARE: "S",
+            Tool.ARROW: "A",
+            Tool.ERASER: "E",
+            Tool.LINE: "L"
+        }
+        
         for tool in Tool:
             symbol = tool_symbols.get(tool, tool.value[0])
             btn = QPushButton(symbol, self)
             btn.setCheckable(True)
-            btn.setToolTip(f"{tool.value} Tool")
+            shortcut = tool_shortcuts.get(tool, "")
+            btn.setToolTip(f"{tool.value} Tool ({shortcut})")
             btn.clicked.connect(lambda checked, t=tool: self.set_tool(t))
             self.tool_group.addButton(btn)
             toolbar.addWidget(btn)
@@ -467,11 +555,17 @@ class MainWindow(QMainWindow):
             btn.setObjectName("color_btn")
             btn.setCheckable(True)
             
-            # Use color hex for button background
-            r, g, b = col_info["rgb"]
+            # Use base shade for initial button background
+            r, g, b = col_info["shades"][1]["rgb"]
             hex_color = f"rgb({r},{g},{b})"
             btn.setStyleSheet(f"background-color: {hex_color};")
-            btn.setToolTip(f"{col_info['name']} Color ({idx})")
+            btn.setToolTip(f"{col_info['name']} Color ({idx})\nRight-click for shades\nAlt+Shift+{idx} to cycle shades")
+            
+            # Enable custom context menu for right-click
+            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, index=idx, b=btn: self.show_color_shades_menu(pos, index, b)
+            )
             
             btn.clicked.connect(lambda checked, index=idx: self.set_color(index))
             self.color_group.addButton(btn)
@@ -536,6 +630,8 @@ class MainWindow(QMainWindow):
     def set_tool(self, tool):
         if hasattr(self.viewer, 'cancel_callout'):
             self.viewer.cancel_callout()
+        if hasattr(self.viewer, 'cancel_line'):
+            self.viewer.cancel_line()
         self.state.active_tool = tool
         self.update_active_ui_indicators()
         self.show_status_message(f"Selected Tool: {tool.value}")
@@ -578,6 +674,20 @@ class MainWindow(QMainWindow):
         # Set checked state for colors
         if self.state.active_color_index in self.color_buttons:
             self.color_buttons[self.state.active_color_index].setChecked(True)
+            
+        # Update ALL color buttons to reflect their current shade preferences for the active tool
+        for idx, btn in self.color_buttons.items():
+            # If the button is the active color, it should display the active shade.
+            # Otherwise, just display the medium/base shade (index 1) or the last used shade?
+            # Actually, the user asked to toggle the shade always on increasing.
+            # Let's just always display the currently active shade for the *selected* color, 
+            # and the base shade for the unselected colors to keep the palette recognizable.
+            if idx == self.state.active_color_index:
+                r, g, b = COLORS[idx]["shades"][self.state.active_shade_index]["rgb"]
+                btn.setStyleSheet(f"background-color: rgb({r},{g},{b});")
+            else:
+                r, g, b = COLORS[idx]["shades"][1]["rgb"]
+                btn.setStyleSheet(f"background-color: rgb({r},{g},{b});")
             
         # Set checked state for Rect Mode button
         if hasattr(self, 'btn_rect_mode'):
@@ -670,6 +780,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.maybe_save_changes():
             self.save_current_position()
+            self.state.save_prefs()
             
             # Save geometry, state, and splitter sizes
             from PyQt6.QtCore import QSettings
@@ -731,7 +842,7 @@ class MainWindow(QMainWindow):
         self.page_spin.setRange(1, total)
         self.page_spin.setValue(current)
         self.page_spin.blockSignals(False)
-        self.show_status_message(f"Page {current} of {total}")
+        self.page_label.setText(f"Page {current} of {total}")
         self.update_outline_selection(current)
 
     def goto_page(self, page_num):

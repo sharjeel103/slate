@@ -110,6 +110,20 @@ class PDFDocument:
         annot.update()
         return annot.rect
 
+    def add_line_annotation(self, page_num, p1, p2, color_rgb, width=2):
+        """
+        Adds a straight line annotation.
+        p1, p2: fitz.Point or (x, y) tuple in PDF points.
+        color_rgb: tuple of (r, g, b) floats (0.0 to 1.0).
+        width: line thickness.
+        """
+        page = self.doc[page_num]
+        annot = page.add_line_annot(p1, p2)
+        annot.set_colors(stroke=color_rgb)
+        annot.set_border(width=width)
+        annot.update()
+        return annot.rect
+
     def add_arrow_annotation(self, page_num, p1, p2, color_rgb, width=2):
         """
         Adds a line with a custom-proportioned arrowhead as a single Ink annotation.

@@ -38,6 +38,7 @@
 | **`T`** | **Text** | Click to type text. Click existing text to edit/drag. |
 | **`S`** | **Square** | Draw a rectangle/square outline shape. |
 | **`A`** | **Arrow** | Draw an arrow shape. |
+| **`C`** | **Callout** | Callout Tool (Box → Arrow → Text workflow) |
 | **`E`** | **Eraser** | Click/drag over any annotation to delete it. |
 | **`Hold Ctrl + Shift`** | **Temporary Eraser** | Press and hold `Ctrl + Shift` to erase; release to return to active tool. |
 | **`R`** | **Rect Selection** | Toggle rectangle-box selection mode on/off. |
