@@ -108,7 +108,10 @@ class InnerTextInputWidget(QTextEdit):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self.parent_container.cancel()
+            if getattr(self.parent_container, 'is_callout', False):
+                self.parent_container.cancel()
+            else:
+                self.parent_container.commit()
         else:
             super().keyPressEvent(event)
 
@@ -673,7 +676,7 @@ class PDFViewer(QGraphicsView):
             
             # Convert adjusted coordinates back to scene and viewport coordinates
             adjusted_local_x = start_x * self.zoom
-            adjusted_local_y = local_pos.y() - 8.0
+            adjusted_local_y = local_pos.y()
             adjusted_scene_pos = QPointF(
                 page_item.pos().x() + adjusted_local_x,
                 page_item.pos().y() + adjusted_local_y
@@ -824,7 +827,7 @@ class PDFViewer(QGraphicsView):
                 max_width_px = int(max_width_pdf * self.zoom)
                 
                 adjusted_local_x = start_x * self.zoom
-                adjusted_local_y = local_pos.y() - 8.0
+                adjusted_local_y = local_pos.y()
                 adjusted_scene_pos = QPointF(
                     page_item.pos().x() + adjusted_local_x,
                     page_item.pos().y() + adjusted_local_y
@@ -834,6 +837,7 @@ class PDFViewer(QGraphicsView):
                 self.active_text_widget = TextInputWidget(self.viewport())
                 self.active_text_widget.max_allowed_width = max_width_px
                 self.active_text_widget.scene_pos = adjusted_scene_pos
+                self.active_text_widget.is_callout = True
                 self.active_text_widget.page_num = page_item.page_num
                 self.active_text_widget.color_pdf = self.state.active_color_pdf
                 self.active_text_widget.font_size = self.state.active_font_size
@@ -1246,6 +1250,17 @@ class PDFViewer(QGraphicsView):
                     
                     self.active_text_widget = TextInputWidget(self.viewport())
                     self.active_text_widget.scene_pos = annot_scene_topleft
+                    if getattr(self, 'dragged_annot_type', None) == 19: # FreeText type check or Callout check based on type code, but we just set it true for callout line structure
+                        # It's an edit, but to be safe, if we are editing text, let's just use the default save behavior, or we can check if it's a Callout. Actually, we can just say if it's a callout, `is_callout = True`
+                        # In PyMuPDF, FreeText is type 2. If it's a callout it's also FreeText but with line data.
+                        # Wait, `self.dragged_annot_type == 2` for FreeText. Let's just always commit on Esc during edits for simplicity, or we can check.
+                        pass
+                    # Let's set it if it's a callout
+                    if getattr(self, 'dragged_annot_type', None) == 2 and hasattr(self, 'callout_phase') and getattr(self, 'active_callout_points', None) is not None:
+                         # Actually if we double click to edit, we don't have active_callout_points. We are just editing FreeText.
+                         # Let's just let it be False so Escape saves the edit.
+                         pass
+                    
                     self.active_text_widget.page_num = self.dragged_annot_page
                     self.active_text_widget.editing_annot_rect = self.dragged_annot_rect
                     self.active_text_widget.editing_annot_page = self.dragged_annot_page
@@ -1617,7 +1632,7 @@ class PDFViewer(QGraphicsView):
                 page_width, page_height = self.pdf_doc.get_page_size(page_item.page_num)
                 
                 start_x = pdf_point.x
-                start_y = pdf_point.y # Removed artificial offset, letting the Qt creation offset dictate the position
+                start_y = pdf_point.y - 4.0 # Restore offset for PyMuPDF FreeText padding
                 
                 if start_x + rect_width > page_width - 10.0:
                     start_x = max(10.0, page_width - rect_width - 10.0)

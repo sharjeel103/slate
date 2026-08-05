@@ -374,9 +374,9 @@ class MainWindow(QMainWindow):
         search_action.triggered.connect(self.viewer.show_search_bar)
         self.addAction(search_action)
 
-        # Bind Alt+Shift+[1-5] for toggling color shades
+        # Bind Alt+[1-5] for toggling color shades
         for idx in range(1, 6):
-            shortcut = QShortcut(QKeySequence(f"Alt+Shift+{idx}"), self)
+            shortcut = QShortcut(QKeySequence(f"Alt+{idx}"), self)
             shortcut.activated.connect(lambda i=idx: self.toggle_color_shade(i))
 
         # Line tool shortcut
@@ -559,7 +559,7 @@ class MainWindow(QMainWindow):
             r, g, b = col_info["shades"][1]["rgb"]
             hex_color = f"rgb({r},{g},{b})"
             btn.setStyleSheet(f"background-color: {hex_color};")
-            btn.setToolTip(f"{col_info['name']} Color ({idx})\nRight-click for shades\nAlt+Shift+{idx} to cycle shades")
+            btn.setToolTip(f"{col_info['name']} Color ({idx})\nRight-click for shades\nAlt+{idx} to cycle shades")
             
             # Enable custom context menu for right-click
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
