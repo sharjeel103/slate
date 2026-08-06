@@ -108,10 +108,7 @@ class InnerTextInputWidget(QTextEdit):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            if getattr(self.parent_container, 'is_callout', False):
-                self.parent_container.cancel()
-            else:
-                self.parent_container.commit()
+            self.parent_container.commit()
         else:
             super().keyPressEvent(event)
 
