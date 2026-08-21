@@ -222,10 +222,14 @@ class PDFPageItem(QGraphicsRectItem):
         if self.pixmap_item is not None:
             return
             
-        qimg = self.pdf_doc.render_page(self.page_num, zoom=self.zoom)
+        dpr = self.viewer.devicePixelRatioF() if hasattr(self.viewer, 'devicePixelRatioF') else 1.0
+        qimg = self.pdf_doc.render_page(self.page_num, zoom=self.zoom, dpr=dpr)
         pixmap = QPixmap.fromImage(qimg)
+        if dpr != 1.0:
+            pixmap.setDevicePixelRatio(dpr)
         
         self.pixmap_item = QGraphicsPixmapItem(pixmap, self)
+        self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.pixmap_item.setPos(0, 0)
         
         # Remove placeholder background brush
@@ -286,6 +290,8 @@ class PDFViewer(QGraphicsView):
         
         # Viewer UI configuration
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setStyleSheet("background-color: #111827; border: none;") # Gray 900 background
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -313,6 +319,9 @@ class PDFViewer(QGraphicsView):
         self.selection_end_word_idx = -1
         self.selected_word_items = []
         self.selected_text_content = ""
+        self.selected_words_by_page = {}  # {page_num: set(word_indices)} for Tool.SELECT
+        self.selection_anchor = None      # (page_num, word_idx) for Tool.SELECT
+        self.selection_start_scene_pos = None
         
         # Click sequence tracking for double/triple click detection
         self.last_click_time = 0.0
@@ -509,6 +518,133 @@ class PDFViewer(QGraphicsView):
                 return item, local_pos
         return None, None
 
+    def get_page_or_nearest(self, scene_pos):
+        """Finds the page under scene_pos, or the vertically closest page item."""
+        item, local_pos = self.get_page_under_pos(scene_pos)
+        if item:
+            return item, local_pos
+        if not self.page_items:
+            return None, None
+        
+        y = scene_pos.y()
+        if y <= self.page_items[0].pos().y():
+            item = self.page_items[0]
+            return item, scene_pos - item.pos()
+        if y >= self.page_items[-1].pos().y() + self.page_items[-1].rect().height():
+            item = self.page_items[-1]
+            return item, scene_pos - item.pos()
+            
+        for i in range(len(self.page_items) - 1):
+            top_item = self.page_items[i]
+            bottom_item = self.page_items[i + 1]
+            top_bottom_y = top_item.pos().y() + top_item.rect().height()
+            bottom_top_y = bottom_item.pos().y()
+            if top_bottom_y <= y <= bottom_top_y:
+                mid_y = (top_bottom_y + bottom_top_y) / 2.0
+                if y < mid_y:
+                    return top_item, scene_pos - top_item.pos()
+                else:
+                    return bottom_item, scene_pos - bottom_item.pos()
+        return self.page_items[0], scene_pos - self.page_items[0].pos()
+
+    def find_reading_order_word_index(self, page_num, local_pos):
+        """Finds the exact or nearest reading-order word index on a specific page."""
+        if not self.pdf_doc or page_num < 0 or page_num >= self.pdf_doc.page_count:
+            return -1
+        words = self.pdf_doc.get_words(page_num)
+        if not words:
+            return -1
+            
+        pdf_point = self.get_pdf_point(local_pos)
+        
+        # 1. Exact containment (with 2-point padding)
+        for idx, w in enumerate(words):
+            rect = fitz.Rect(w[0] - 2, w[1] - 2, w[2] + 2, w[3] + 2)
+            if rect.contains(pdf_point):
+                return idx
+                
+        # 2. Proximity: above page text -> first word
+        if pdf_point.y <= words[0][1]:
+            return 0
+        # Below page text -> last word
+        if pdf_point.y >= words[-1][3]:
+            return len(words) - 1
+            
+        # 3. Find word with closest vertical & horizontal distance
+        best_idx = -1
+        best_dist = float('inf')
+        
+        for idx, w in enumerate(words):
+            if w[1] <= pdf_point.y <= w[3]:
+                if pdf_point.x < w[0]:
+                    dist_metric = (w[0] - pdf_point.x)
+                elif pdf_point.x > w[2]:
+                    dist_metric = (pdf_point.x - w[2])
+                else:
+                    dist_metric = 0
+            else:
+                dy = min(abs(pdf_point.y - w[1]), abs(pdf_point.y - w[3]))
+                dx = max(0.0, min(abs(pdf_point.x - w[0]), abs(pdf_point.x - w[2]))) if (pdf_point.x < w[0] or pdf_point.x > w[2]) else 0.0
+                dist_metric = dy * 10.0 + dx
+                
+            if dist_metric < best_dist:
+                best_dist = dist_metric
+                best_idx = idx
+                
+        return best_idx if best_idx != -1 else 0
+
+    def compute_range_selection(self, start_page, start_idx, end_page, end_idx):
+        """Computes dictionary of {page_num: set(word_indices)} between two anchor points in reading order."""
+        if start_page == end_page:
+            s = min(start_idx, end_idx)
+            e = max(start_idx, end_idx)
+            return {start_page: set(range(s, e + 1))}
+            
+        result = {}
+        if start_page < end_page:
+            words_start = self.pdf_doc.get_words(start_page)
+            if words_start:
+                s_idx = max(0, min(start_idx, len(words_start) - 1))
+                result[start_page] = set(range(s_idx, len(words_start)))
+            for p in range(start_page + 1, end_page):
+                words_p = self.pdf_doc.get_words(p)
+                if words_p:
+                    result[p] = set(range(len(words_p)))
+            words_end = self.pdf_doc.get_words(end_page)
+            if words_end:
+                e_idx = max(0, min(end_idx, len(words_end) - 1))
+                result[end_page] = set(range(0, e_idx + 1))
+        else: # start_page > end_page (backwards drag / shift-click)
+            words_end = self.pdf_doc.get_words(end_page)
+            if words_end:
+                e_idx = max(0, min(end_idx, len(words_end) - 1))
+                result[end_page] = set(range(e_idx, len(words_end)))
+            for p in range(end_page + 1, start_page):
+                words_p = self.pdf_doc.get_words(p)
+                if words_p:
+                    result[p] = set(range(len(words_p)))
+            words_start = self.pdf_doc.get_words(start_page)
+            if words_start:
+                s_idx = max(0, min(start_idx, len(words_start) - 1))
+                result[start_page] = set(range(0, s_idx + 1))
+                
+        return result
+
+    def _merge_page_selections(self, base_dict, new_dict, xor=False):
+        """Combines two {page_num: set(indices)} selections."""
+        all_pages = set(base_dict.keys()) | set(new_dict.keys())
+        merged = {}
+        for p in all_pages:
+            s_base = base_dict.get(p, set())
+            s_new = new_dict.get(p, set())
+            if xor:
+                combined = s_base ^ s_new
+            else:
+                combined = s_base | s_new
+            if combined:
+                merged[p] = combined
+        return merged
+
     def get_pdf_point(self, local_pos):
         """Converts page-local scene coordinates to PDF Points."""
         return fitz.Point(local_pos.x() / self.zoom, local_pos.y() / self.zoom)
@@ -574,7 +710,7 @@ class PDFViewer(QGraphicsView):
             pen = QPen(QColor(*self.state.active_color_rgb), self.state.active_line_width * self.zoom, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             self.temp_path_item = self._scene.addPath(self.active_path, pen)
             
-        elif tool in (Tool.HIGHLIGHT, Tool.SELECT):
+        elif tool == Tool.HIGHLIGHT:
             self.drawing = True
             
             modifiers = QApplication.keyboardModifiers()
@@ -603,7 +739,7 @@ class PDFViewer(QGraphicsView):
             
             if self.click_sequence_count == 2 and target_idx != -1:
                 # Double click: select the clicked word
-                self.drawing = False  # Disable drag expansion
+                self.drawing = False
                 self.selection_start_word_idx = target_idx
                 self.selection_end_word_idx = target_idx
                 
@@ -614,19 +750,14 @@ class PDFViewer(QGraphicsView):
                     self.selected_word_indices = current_drag
                     
                 self.update_selection_overlays()
-                
-                if tool == Tool.SELECT:
-                    self.copy_selection_to_clipboard()
-                elif tool == Tool.HIGHLIGHT:
-                    self.apply_highlight_to_selection()
+                self.apply_highlight_to_selection()
                     
             elif self.click_sequence_count >= 3 and target_idx != -1:
                 # Triple click: select the whole paragraph (block)
-                self.drawing = False  # Disable drag expansion
+                self.drawing = False
                 words = self.pdf_doc.get_words(page_item.page_num)
                 block_no = words[target_idx][5]
                 
-                # Find all word indices belonging to the same block
                 block_indices = [i for i, w in enumerate(words) if w[5] == block_no]
                 if block_indices:
                     self.selection_start_word_idx = min(block_indices)
@@ -639,11 +770,7 @@ class PDFViewer(QGraphicsView):
                         self.selected_word_indices = current_drag
                         
                     self.update_selection_overlays()
-                    
-                    if tool == Tool.SELECT:
-                        self.copy_selection_to_clipboard()
-                    elif tool == Tool.HIGHLIGHT:
-                        self.apply_highlight_to_selection()
+                    self.apply_highlight_to_selection()
             else:
                 # Single click: normal selection start
                 self.selection_start_word_idx = target_idx
@@ -653,6 +780,84 @@ class PDFViewer(QGraphicsView):
                     self.selected_word_indices = [target_idx]
                 else:
                     self.selected_word_indices = set()
+                self.update_selection_overlays()
+
+        elif tool == Tool.SELECT:
+            self.drawing = True
+            
+            modifiers = QApplication.keyboardModifiers()
+            is_shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+            self.is_ctrl_pressed = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+            
+            now = time.time()
+            if now - self.last_click_time < 0.35:
+                self.click_sequence_count += 1
+            else:
+                self.click_sequence_count = 1
+            self.last_click_time = now
+            
+            target_idx = self.find_reading_order_word_index(page_item.page_num, local_pos)
+            
+            if is_shift and self.selection_anchor is not None and target_idx != -1:
+                # Shift + Click: Extend selection from anchor to target!
+                self.drawing = False
+                anchor_page, anchor_idx = self.selection_anchor
+                self.selected_words_by_page = self.compute_range_selection(
+                    anchor_page, anchor_idx, page_item.page_num, target_idx
+                )
+                self.update_selection_overlays()
+                self.copy_selection_to_clipboard()
+                return
+                
+            if self.click_sequence_count == 2 and target_idx != -1:
+                # Double click: select clicked word
+                self.drawing = False
+                self.selection_anchor = (page_item.page_num, target_idx)
+                current_drag = {page_item.page_num: {target_idx}}
+                if self.is_ctrl_pressed:
+                    self.selected_words_by_page = self._merge_page_selections(
+                        getattr(self, 'accumulated_selection_by_page', {}), current_drag, xor=True
+                    )
+                else:
+                    self.selected_words_by_page = current_drag
+                self.update_selection_overlays()
+                self.copy_selection_to_clipboard()
+                
+            elif self.click_sequence_count >= 3 and target_idx != -1:
+                # Triple click: select paragraph (block)
+                self.drawing = False
+                words = self.pdf_doc.get_words(page_item.page_num)
+                block_no = words[target_idx][5]
+                block_indices = [i for i, w in enumerate(words) if w[5] == block_no]
+                if block_indices:
+                    self.selection_anchor = (page_item.page_num, min(block_indices))
+                    current_drag = {page_item.page_num: set(block_indices)}
+                    if self.is_ctrl_pressed:
+                        self.selected_words_by_page = self._merge_page_selections(
+                            getattr(self, 'accumulated_selection_by_page', {}), current_drag, xor=True
+                        )
+                    else:
+                        self.selected_words_by_page = current_drag
+                    self.update_selection_overlays()
+                    self.copy_selection_to_clipboard()
+            else:
+                # Single click: start normal selection
+                if not self.is_ctrl_pressed:
+                    self.clear_selection_graphics()
+                    self.accumulated_selection_by_page = {}
+                else:
+                    self.accumulated_selection_by_page = {p: set(s) for p, s in self.selected_words_by_page.items()}
+                    self.clear_selected_word_graphics()
+                    
+                self.selection_anchor = (page_item.page_num, target_idx)
+                self.selection_start_scene_pos = scene_pos
+                self.selection_start_local_pos = local_pos
+                self.active_page_num = page_item.page_num
+                
+                if target_idx != -1:
+                    self.selected_words_by_page = {page_item.page_num: {target_idx}}
+                else:
+                    self.selected_words_by_page = {}
                 self.update_selection_overlays()
             
         elif tool == Tool.TEXT:
@@ -953,7 +1158,7 @@ class PDFViewer(QGraphicsView):
             self.active_path.lineTo(scene_pos)
             self.temp_path_item.setPath(self.active_path)
             
-        elif tool in (Tool.HIGHLIGHT, Tool.SELECT):
+        elif tool == Tool.HIGHLIGHT:
             # Update temporary drag selection box graphic
             if self.state.rect_select_mode and hasattr(self, 'selection_start_local_pos'):
                 active_item = self.page_items[self.active_page_num]
@@ -1014,6 +1219,70 @@ class PDFViewer(QGraphicsView):
                         self.selected_word_indices = current_drag
                         
                     self.update_selection_overlays()
+
+        elif tool == Tool.SELECT:
+            if not self.drawing:
+                return
+                
+            if self.state.rect_select_mode and hasattr(self, 'selection_start_scene_pos') and self.selection_start_scene_pos:
+                x0 = min(self.selection_start_scene_pos.x(), scene_pos.x())
+                y0 = min(self.selection_start_scene_pos.y(), scene_pos.y())
+                w_px = abs(self.selection_start_scene_pos.x() - scene_pos.x())
+                h_px = abs(self.selection_start_scene_pos.y() - scene_pos.y())
+                scene_rect = QRectF(x0, y0, w_px, h_px)
+                
+                if not hasattr(self, 'temp_rect_item') or self.temp_rect_item is None:
+                    self.temp_rect_item = QGraphicsRectItem(scene_rect)
+                    pen = QPen(QColor(59, 130, 246), 1.5, Qt.PenStyle.DashLine)
+                    self.temp_rect_item.setPen(pen)
+                    self.temp_rect_item.setBrush(QBrush(QColor(59, 130, 246, 30)))
+                    self.temp_rect_item.setZValue(1000.0)
+                    self._scene.addItem(self.temp_rect_item)
+                else:
+                    self.temp_rect_item.setRect(scene_rect)
+                    
+                current_drag = {}
+                for item in self.page_items:
+                    if scene_rect.intersects(item.sceneBoundingRect()):
+                        p_rect = scene_rect.intersected(item.sceneBoundingRect())
+                        lx0 = (p_rect.left() - item.pos().x()) / self.zoom
+                        ly0 = (p_rect.top() - item.pos().y()) / self.zoom
+                        lx1 = (p_rect.right() - item.pos().x()) / self.zoom
+                        ly1 = (p_rect.bottom() - item.pos().y()) / self.zoom
+                        drag_pdf_rect = fitz.Rect(lx0, ly0, lx1, ly1)
+                        
+                        words = self.pdf_doc.get_words(item.page_num)
+                        page_drag_words = set()
+                        for idx, w in enumerate(words):
+                            word_rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                            if word_rect.intersects(drag_pdf_rect):
+                                page_drag_words.add(idx)
+                        if page_drag_words:
+                            current_drag[item.page_num] = page_drag_words
+                            
+                if getattr(self, 'is_ctrl_pressed', False):
+                    self.selected_words_by_page = self._merge_page_selections(
+                        getattr(self, 'accumulated_selection_by_page', {}), current_drag, xor=True
+                    )
+                else:
+                    self.selected_words_by_page = current_drag
+                self.update_selection_overlays()
+            else:
+                curr_item, curr_local_pos = self.get_page_or_nearest(scene_pos)
+                if curr_item and self.selection_anchor:
+                    anchor_page, anchor_idx = self.selection_anchor
+                    curr_page = curr_item.page_num
+                    curr_word_idx = self.find_reading_order_word_index(curr_page, curr_local_pos)
+                    
+                    if curr_word_idx != -1 and anchor_idx != -1:
+                        current_drag = self.compute_range_selection(anchor_page, anchor_idx, curr_page, curr_word_idx)
+                        if getattr(self, 'is_ctrl_pressed', False):
+                            self.selected_words_by_page = self._merge_page_selections(
+                                getattr(self, 'accumulated_selection_by_page', {}), current_drag, xor=True
+                            )
+                        else:
+                            self.selected_words_by_page = current_drag
+                        self.update_selection_overlays()
                     
         elif tool == Tool.ERASER:
             self.erase_at(self.active_page_num, local_pos)
@@ -1425,18 +1694,42 @@ class PDFViewer(QGraphicsView):
 
     def update_selection_overlays(self):
         self.clear_selected_word_graphics()
+        tool = self.state.active_tool
+        
+        # Tool.SELECT: Multi-page selection overlay
+        if tool == Tool.SELECT:
+            if not getattr(self, 'selected_words_by_page', {}):
+                return
+            color = QColor(59, 130, 246, 90)
+            for page_num, word_indices in self.selected_words_by_page.items():
+                if 0 <= page_num < len(self.page_items) and word_indices:
+                    words = self.pdf_doc.get_words(page_num)
+                    page_item = self.page_items[page_num]
+                    for idx in word_indices:
+                        if idx < 0 or idx >= len(words):
+                            continue
+                        w = words[idx]
+                        scene_rect = QRectF(
+                            page_item.pos().x() + w[0] * self.zoom,
+                            page_item.pos().y() + w[1] * self.zoom,
+                            (w[2] - w[0]) * self.zoom,
+                            (w[3] - w[1]) * self.zoom
+                        )
+                        item = QGraphicsRectItem(scene_rect)
+                        item.setBrush(color)
+                        item.setPen(QPen(Qt.PenStyle.NoPen))
+                        item.setZValue(999.0)
+                        self._scene.addItem(item)
+                        self.selected_word_items.append(item)
+            return
+
+        # Tool.HIGHLIGHT: Single-page selection overlay unchanged
         if self.active_page_num == -1 or not getattr(self, 'selected_word_indices', set()):
             return
             
         words = self.pdf_doc.get_words(self.active_page_num)
-        
-        tool = self.state.active_tool
-        if tool == Tool.HIGHLIGHT:
-            color = QColor(*self.state.active_color_rgb)
-            color.setAlpha(90)
-        else:
-            color = QColor(59, 130, 246, 90)
-            
+        color = QColor(*self.state.active_color_rgb)
+        color.setAlpha(90)
         active_item = self.page_items[self.active_page_num]
         
         for idx in self.selected_word_indices:
@@ -1508,7 +1801,75 @@ class PDFViewer(QGraphicsView):
         self.clear_selection_graphics()
 
     def copy_selection_to_clipboard(self):
-        """Processes the selected text range, saving it in memory but NOT auto-copying to clipboard."""
+        """Processes the selected text range across all pages for Tool.SELECT or single page for other tools."""
+        tool = self.state.active_tool
+        
+        if tool == Tool.SELECT:
+            if not getattr(self, 'selected_words_by_page', {}):
+                self.selected_text_content = ""
+                return
+                
+            page_texts = []
+            for page_num in sorted(self.selected_words_by_page.keys()):
+                indices = self.selected_words_by_page[page_num]
+                if not indices:
+                    continue
+                words = self.pdf_doc.get_words(page_num)
+                sorted_indices = sorted(list(indices))
+                selected_words = [words[idx] for idx in sorted_indices if 0 <= idx < len(words)]
+                if not selected_words:
+                    continue
+                    
+                selected_blocks = set(w[5] for w in selected_words)
+                min_x = min(w[0] for w in words if w[5] in selected_blocks)
+                
+                text_parts = []
+                last_block = -1
+                last_line = -1
+                last_word_no = -1
+                
+                for w in selected_words:
+                    block_no = w[5]
+                    line_no = w[6]
+                    word_no = w[7]
+                    word_str = w[4]
+                    
+                    if last_block != -1:
+                        if block_no != last_block or line_no != last_line:
+                            if block_no != last_block:
+                                text_parts.append("\n\n")
+                            else:
+                                text_parts.append("\n")
+                            char_width = (w[2] - w[0]) / max(len(w[4]), 1)
+                            indent = max(0.0, w[0] - min_x)
+                            num_spaces = int(round(indent / char_width)) if char_width > 0 else 0
+                            text_parts.append(" " * num_spaces)
+                        elif word_no != last_word_no + 1:
+                            text_parts.append(" ... ")
+                        else:
+                            text_parts.append(" ")
+                    else:
+                        char_width = (w[2] - w[0]) / max(len(w[4]), 1)
+                        indent = max(0.0, w[0] - min_x)
+                        num_spaces = int(round(indent / char_width)) if char_width > 0 else 0
+                        text_parts.append(" " * num_spaces)
+                    
+                    text_parts.append(word_str)
+                    last_block = block_no
+                    last_line = line_no
+                    last_word_no = word_no
+                    
+                page_text = "".join(text_parts).strip()
+                if page_text:
+                    page_texts.append(page_text)
+                    
+            self.selected_text_content = "\n\n".join(page_texts)
+            if self.selected_text_content:
+                status_preview = self.selected_text_content.replace("\n", " ")[:40]
+                self.status_message.emit(f"Selected text (Press Ctrl+C to copy): \"{status_preview}...\"")
+            return
+
+        # Fallback for single-page selections (e.g. Tool.HIGHLIGHT)
         if self.active_page_num == -1 or not getattr(self, 'selected_word_indices', set()):
             self.clear_selection_graphics()
             return
@@ -1541,17 +1902,15 @@ class PDFViewer(QGraphicsView):
                         text_parts.append("\n\n")
                     else:
                         text_parts.append("\n")
-                    # Calculate and insert visual indentation
                     char_width = (w[2] - w[0]) / max(len(w[4]), 1)
                     indent = max(0.0, w[0] - min_x)
                     num_spaces = int(round(indent / char_width)) if char_width > 0 else 0
                     text_parts.append(" " * num_spaces)
                 elif word_no != last_word_no + 1:
-                    text_parts.append(" ... ") # Indication of skipped words
+                    text_parts.append(" ... ")
                 else:
                     text_parts.append(" ")
             else:
-                # Initial indentation for the very first line if they didn't select from the leftmost edge
                 char_width = (w[2] - w[0]) / max(len(w[4]), 1)
                 indent = max(0.0, w[0] - min_x)
                 num_spaces = int(round(indent / char_width)) if char_width > 0 else 0
@@ -1616,10 +1975,10 @@ class PDFViewer(QGraphicsView):
                 
                 # Convert widget dimensions (pixels) back to PDF points
                 if not getattr(widget, 'auto_width', True) and not getattr(widget, 'resized_manually', False) and getattr(widget, 'editing_annot_rect', None):
-                    rect_width = widget.editing_annot_rect.width
+                    rect_width = widget.editing_annot_rect.width + 4.0
                 else:
-                    doc_width = widget.text_edit.document().idealWidth() + 4.0 if getattr(widget, 'auto_width', True) else widget.text_edit.width()
-                    rect_width = doc_width / self.zoom
+                    doc_width = widget.text_edit.document().idealWidth() + 8.0 if getattr(widget, 'auto_width', True) else widget.text_edit.width()
+                    rect_width = (doc_width / self.zoom) + 4.0
                 
                 # Height is the true text document height plus a minimal vertical buffer (2 PDF points)
                 # to prevent the invisible bounding box from extending far below the text
@@ -1631,15 +1990,15 @@ class PDFViewer(QGraphicsView):
                 start_x = pdf_point.x
                 start_y = pdf_point.y - 4.0 # Restore offset for PyMuPDF FreeText padding
                 
-                if start_x + rect_width > page_width - 10.0:
-                    start_x = max(10.0, page_width - rect_width - 10.0)
                 if start_x < 10.0:
                     start_x = 10.0
+                if start_x + rect_width > page_width - 10.0:
+                    rect_width = max(20.0, page_width - start_x - 10.0)
                     
-                if start_y + rect_height > page_height - 10.0:
-                    start_y = max(10.0, page_height - rect_height - 10.0)
                 if start_y < 10.0:
                     start_y = 10.0
+                if start_y + rect_height > page_height - 10.0:
+                    rect_height = max(10.0, page_height - start_y - 10.0)
                     
                 rect = fitz.Rect(start_x, start_y, start_x + rect_width, start_y + rect_height)
                 
@@ -1672,6 +2031,7 @@ class PDFViewer(QGraphicsView):
         self.selection_start_word_idx = -1
         self.selection_end_word_idx = -1
         self.selected_word_indices = set()
+        self.selected_words_by_page = {}
         self.clear_selected_word_graphics()
         self.selected_text_content = ""
         self.cleanup_temp_rect()

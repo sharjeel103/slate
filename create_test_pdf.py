@@ -82,6 +82,7 @@ def create_pdf():
         ("T", "Text Mode (FreeText annotations - click anywhere to type)"),
         ("S", "Square Mode (Vector rectangles)"),
         ("A", "Arrow Mode (Vector directional arrows)"),
+        ("C", "Callout Mode (Box -> Arrow -> Text workflow)"),
         ("E", "Eraser Mode (Click/drag to delete annotations)"),
         ("Hold Ctrl + Shift", "Temporary Eraser toggle (reverts back to active tool on release)")
     ]

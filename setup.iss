@@ -1,6 +1,6 @@
 [Setup]
 AppName=Slate
-AppVersion=1.0.0
+AppVersion=1.1.0
 AppPublisher=Sharjeel Ahmed
 DefaultDirName={autopf}\Slate
 DefaultGroupName=Slate

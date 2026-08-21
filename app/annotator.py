@@ -19,11 +19,11 @@ class PDFDocument:
         """Returns (width, height) of the page in PDF points."""
         return self.page_sizes[page_num]
         
-    def render_page(self, page_num, zoom=2.0):
-        """Renders the page to a PyQt QImage."""
+    def render_page(self, page_num, zoom=2.0, dpr=1.0):
+        """Renders the page to a PyQt QImage with device pixel ratio scaling."""
         page = self.doc[page_num]
-        # Use matrix for zoom/DPI scaling
-        mat = fitz.Matrix(zoom, zoom)
+        total_scale = zoom * dpr
+        mat = fitz.Matrix(total_scale, total_scale)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         
         # Create QImage from raw RGB data
@@ -36,6 +36,9 @@ class PDFDocument:
             QImage.Format.Format_RGB888
         ).copy()
         
+        if dpr != 1.0:
+            qimg.setDevicePixelRatio(dpr)
+            
         return qimg
 
     def get_words(self, page_num):
